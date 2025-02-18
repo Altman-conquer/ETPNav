@@ -523,6 +523,8 @@ class RLTrainer(BaseVLNCETrainer):
         self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.SHUFFLE = False
         self.config.TASK_CONFIG.ENVIRONMENT.ITERATOR_OPTIONS.MAX_SCENE_REPEAT_STEPS = -1
         self.config.IL.ckpt_to_load = checkpoint_path
+
+        print(f'Current Video Options: {self.config.VIDEO_OPTION}')
         if self.config.VIDEO_OPTION:
             self.config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP_VLNCE")
             self.config.TASK_CONFIG.TASK.MEASUREMENTS.append("DISTANCE_TO_GOAL")

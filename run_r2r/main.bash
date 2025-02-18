@@ -24,9 +24,9 @@ flag1="--exp_name release_r2r
 flag2=" --exp_name release_r2r
       --run-type eval
       --exp-config run_r2r/iter_train.yaml
-      SIMULATOR_GPU_IDS [0,1]
-      TORCH_GPU_IDS [0,1]
-      GPU_NUMBERS 2
+      SIMULATOR_GPU_IDS [0,1,2,3]
+      TORCH_GPU_IDS [0,1,2,3]
+      GPU_NUMBERS 4
       NUM_ENVIRONMENTS 8
       TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
       EVAL.CKPT_PATH_DIR data/logs/checkpoints/release_r2r/ckpt.iter12000.pth
@@ -47,14 +47,14 @@ flag3="--exp_name release_r2r
       "
 
 mode=$1
-case $mode in 
+case $mode in
       train)
       echo "###### train mode ######"
       python -m torch.distributed.launch --nproc_per_node=2 --master_port $2 run.py $flag1
       ;;
       eval)
       echo "###### eval mode ######"
-      python -m torch.distributed.launch --nproc_per_node=2 --master_port $2 run.py $flag2
+      python -m torch.distributed.launch --nproc_per_node=4 --master_port $2 run.py $flag2
       ;;
       infer)
       echo "###### infer mode ######"

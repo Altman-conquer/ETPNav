@@ -10,6 +10,7 @@ CHECKPOINT_FOLDER: data/logs/checkpoints/
 EVAL_CKPT_PATH_DIR: data/logs/checkpoints/
 RESULTS_DIR: data/logs/eval_results/
 VIDEO_DIR: data/logs/video/
+#VIDEO_OPTION: ['disk']
 
 INFERENCE:
   SPLIT: test
