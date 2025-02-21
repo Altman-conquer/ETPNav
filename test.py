@@ -160,6 +160,7 @@ def navigateAndSee(action=""):
         if display:
             display_sample(observations["color_sensor"])
 
+navigateAndSee()
 
 action = "turn_right"
 navigateAndSee(action)
@@ -237,3 +238,93 @@ else:
         # easily save a map to file:
         map_filename = os.path.join(output_path, "top_down_map.png")
         imageio.imsave(map_filename, hablab_topdown_map)
+
+
+
+if not sim.pathfinder.is_loaded:
+    print("Pathfinder not initialized, aborting.")
+else:
+    seed = 4  # @param {type:"integer"}
+    sim.pathfinder.seed(seed)
+
+    # fmt off
+    # @markdown 1. Sample valid points on the NavMesh for agent spawn location and pathfinding goal.
+    # fmt on
+    sample1 = sim.pathfinder.get_random_navigable_point()
+    sample2 = sim.pathfinder.get_random_navigable_point()
+
+    # @markdown 2. Use ShortestPath module to compute path between samples.
+    path = habitat_sim.ShortestPath()
+    path.requested_start = sample1
+    path.requested_end = sample2
+    found_path = sim.pathfinder.find_path(path)
+    geodesic_distance = path.geodesic_distance
+    path_points = path.points
+    # @markdown - Success, geodesic path length, and 3D points can be queried.
+    print("found_path : " + str(found_path))
+    print("geodesic_distance : " + str(geodesic_distance))
+    print("path_points : " + str(path_points))
+
+    # @markdown 3. Display trajectory (if found) on a topdown map of ground floor
+    if found_path:
+        meters_per_pixel = 0.025
+        scene_bb = sim.get_active_scene_graph().get_root_node().cumulative_bb
+        height = scene_bb.y().min
+        if display:
+            top_down_map = maps.get_topdown_map(
+                sim.pathfinder, height, meters_per_pixel=meters_per_pixel
+            )
+            recolor_map = np.array(
+                [[255, 255, 255], [128, 128, 128], [0, 0, 0]], dtype=np.uint8
+            )
+            top_down_map = recolor_map[top_down_map]
+            grid_dimensions = (top_down_map.shape[0], top_down_map.shape[1])
+            # convert world trajectory points to maps module grid points
+            trajectory = [
+                maps.to_grid(
+                    path_point[2],
+                    path_point[0],
+                    grid_dimensions,
+                    pathfinder=sim.pathfinder,
+                )
+                for path_point in path_points
+            ]
+            grid_tangent = mn.Vector2(
+                trajectory[1][1] - trajectory[0][1], trajectory[1][0] - trajectory[0][0]
+            )
+            path_initial_tangent = grid_tangent / grid_tangent.length()
+            initial_angle = math.atan2(path_initial_tangent[0], path_initial_tangent[1])
+            # draw the agent and trajectory on the map
+            maps.draw_path(top_down_map, trajectory)
+            maps.draw_agent(
+                top_down_map, trajectory[0], initial_angle, agent_radius_px=8
+            )
+            print("\nDisplay the map with agent and path overlay:")
+            display_map(top_down_map)
+
+        # @markdown 4. (optional) Place agent and render images at trajectory points (if found).
+        display_path_agent_renders = True  # @param{type:"boolean"}
+        if display_path_agent_renders:
+            print("Rendering observations at path points:")
+            tangent = path_points[1] - path_points[0]
+            agent_state = habitat_sim.AgentState()
+            for ix, point in enumerate(path_points):
+                if ix < len(path_points) - 1:
+                    tangent = path_points[ix + 1] - point
+                    agent_state.position = point
+                    tangent_orientation_matrix = mn.Matrix4.look_at(
+                        point, point + tangent, np.array([0, 1.0, 0])
+                    )
+                    tangent_orientation_q = mn.Quaternion.from_matrix(
+                        tangent_orientation_matrix.rotation()
+                    )
+                    agent_state.rotation = utils.quat_from_magnum(tangent_orientation_q)
+                    agent.set_state(agent_state)
+
+                    observations = sim.get_sensor_observations()
+                    rgb = observations["color_sensor"]
+                    # semantic = observations["semantic_sensor"]
+                    # depth = observations["depth_sensor"]
+
+                    if display:
+                        display_sample(rgb)

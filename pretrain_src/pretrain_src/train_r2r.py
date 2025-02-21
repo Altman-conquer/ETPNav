@@ -100,7 +100,8 @@ def main(opts):
         model_config.pretrain_tasks.extend(train_dataset_config['tasks'])
     model_config.pretrain_tasks = set(model_config.pretrain_tasks)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_config.lang_bert_name)
+    # tokenizer = AutoTokenizer.from_pretrained(model_config.lang_bert_name)
+    tokenizer = AutoTokenizer.from_pretrained('/home/zhandijia/.cache/huggingface/transformers/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/')
 
     # Prepare model
     if opts.checkpoint:
