@@ -28,7 +28,7 @@ def main():
     )
     parser.add_argument(
         "--run-type",
-        choices=["train", "eval", "inference"],
+        choices=["train", "eval", "inference", "test"],
         required=True,
         help="run type of the experiment (train, eval, inference)",
     )
@@ -108,6 +108,8 @@ def run_exp(exp_name: str, exp_config: str,
         trainer.eval()
     elif run_type == "inference":
         trainer.inference()
+    elif run_type == "test":
+        trainer.customize_eval()
 
 if __name__ == "__main__":
     main()

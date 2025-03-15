@@ -12,7 +12,7 @@ cachetools==4.2.4
 cfgv==3.3.1
 charset-normalizer==2.0.10
 click==8.0.3
-clip==0.1.0
+clip==1.0
 cloudpickle==2.0.0
 conda-pack==0.6.0
 dataclasses==0.8

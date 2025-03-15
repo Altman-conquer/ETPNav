@@ -547,7 +547,7 @@ def waypoint_observations_to_image(
     return frame.astype(np.uint8)
 
 def colorize_draw_agent_and_fit_to_height(
-    info: Dict[str, Any], 
+    info: Dict[str, Any],
     output_height: int,
     vis_info: Dict,
 ):
@@ -578,7 +578,7 @@ def colorize_draw_agent_and_fit_to_height(
         #     maps.draw_waypoint(top_down_map, vis_info['teacher_ghost'][[0,2]], info["meters_per_px"], info["bounds"], maps.TEACHER_GHOST)
         if 'predict_ghost' in vis_info:
             maps.draw_waypoint(top_down_map, vis_info['predict_ghost'][[0,2]], info["meters_per_px"], info["bounds"], maps.PREDICT_GHOST)
-        
+
     top_down_map = maps.colorize_topdown_map(
         top_down_map, info["fog_of_war_mask"]
     )
@@ -655,9 +655,10 @@ def planner_video_frame(
     eq = CUBE2EQ(cube)
     rgb = eq['rgbback'][0].numpy().copy()
 
+    # vis_info['nodes'].append(np.array([5.2728, 1.66815, -7.86318]))
     top_down_map = colorize_draw_agent_and_fit_to_height(
-        info[map_k], 
-        rgb.shape[0], 
+        info[map_k],
+        rgb.shape[0],
         vis_info,
     )
     frame = np.concatenate([rgb, top_down_map], axis=1)
@@ -692,14 +693,22 @@ def navigator_video_frame(
     #     (frame_width, new_height),
     #     interpolation=cv2.INTER_CUBIC,
     # )
+
+    # cube = {}
+    # for uuid in UUIDS_EQ:
+    #     if uuid not in observations:
+    #         raise
+    #     else:
+    #         cube[uuid] = observations[uuid]
+
     cube = {uuid: observations.pop(uuid) for uuid in UUIDS_EQ}
     cube = {k: torch.from_numpy(v).unsqueeze(0) for k,v in cube.items()}
     eq = CUBE2EQ(cube)
     rgb = eq['rgbback'][0].numpy().copy()
 
     top_down_map = colorize_draw_agent_and_fit_to_height(
-        info[map_k], 
-        rgb.shape[0], 
+        info[map_k],
+        rgb.shape[0],
         vis_info,
     )
     frame = np.concatenate([rgb, top_down_map], axis=1)

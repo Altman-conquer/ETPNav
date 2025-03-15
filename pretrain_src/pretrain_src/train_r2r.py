@@ -51,7 +51,7 @@ def create_dataloaders(
             task_dataset = SapDataset(nav_db, tok, end_vp_pos_ratio=0.2)
             task_collate_fn = sap_collate
         else:
-            raise ValueError(f'Undefined task {task}')
+            raise ValueError(f'Undefined task {task_name}')
 
         LOGGER.info(f"{task_name}: {len(task_dataset)} samples loaded")
 

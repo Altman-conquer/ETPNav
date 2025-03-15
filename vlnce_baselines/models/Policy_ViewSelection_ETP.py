@@ -194,6 +194,10 @@ class ETP(Net):
             depth_embedding = self.depth_encoder(obs_view12)  # torch.Size([bs, 128, 4, 4])
             rgb_embedding = self.rgb_encoder(obs_view12)      # torch.Size([bs, 2048, 7, 7])
 
+            # 只使用rgb/depth
+            # depth_embedding = torch.zeros_like(depth_embedding)
+            # rgb_embedding = torch.zeros_like(rgb_embedding)
+
             ''' waypoint prediction ----------------------------- '''
             waypoint_heatmap_logits = waypoint_predictor(
                 rgb_embedding, depth_embedding)
