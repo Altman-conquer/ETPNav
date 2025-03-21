@@ -198,8 +198,8 @@ class RLTrainer(BaseVLNCETrainer):
         ''' initialize the waypoint predictor here '''
         from vlnce_baselines.waypoint_pred.TRM_net import BinaryDistPredictor_TRM
         self.waypoint_predictor = BinaryDistPredictor_TRM(device=self.device)
-        cwp_fn = 'data/wp_pred/check_cwp_bestdist_hfov63' if self.config.MODEL.task_type == 'rxr' else 'data/wp_pred/check_cwp_bestdist_hfov90'
-        # cwp_fn = 'data/wp_pred/official_val_best_avg_wayscore'
+        # cwp_fn = 'data/wp_pred/check_cwp_bestdist_hfov63' if self.config.MODEL.task_type == 'rxr' else 'data/wp_pred/check_cwp_bestdist_hfov90'
+        cwp_fn = 'data/wp_pred/semantic_check_val_best_avg_wayscore'
         assert self.config.MODEL.task_type == 'r2r'
         self.waypoint_predictor.load_state_dict(
             torch.load(cwp_fn, map_location=torch.device('cpu'))['predictor']['state_dict'])
@@ -1509,7 +1509,7 @@ class RLTrainer(BaseVLNCETrainer):
                         back_path = back_path[1:]
                     else:
                         back_path = None
-                    print('action 4')
+                    # print('action 4')
                     env_actions.append(
                         {
                             'action': {

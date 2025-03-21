@@ -1,9 +1,11 @@
+import concurrent.futures
 from copy import deepcopy
 import numpy as np
 import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from gym import Space
 from habitat import Config
@@ -21,12 +23,12 @@ from vlnce_baselines.models.encoders.instruction_encoder import (
 from vlnce_baselines.models.encoders.resnet_encoders import (
     TorchVisionResNet50,
     VlnResnetDepthEncoder,
-    CLIPEncoder,
+    CLIPEncoder, RGBEncoder,
 )
 from vlnce_baselines.models.policy import ILPolicy
 
 from vlnce_baselines.waypoint_pred.TRM_net import BinaryDistPredictor_TRM
-from vlnce_baselines.waypoint_pred.utils import nms
+from vlnce_baselines.waypoint_pred.utils import nms, send_image_for_inference, process_image
 from vlnce_baselines.models.utils import (
     angle_feature_with_ele, dir_angle_feature_with_ele, angle_feature_torch, length2mask)
 import math
@@ -135,6 +137,7 @@ class ETP(Net):
         #         device,
         #         spatial_output=model_config.spatial_output,
         #     )
+        # self.rgb_encoder = RGBEncoder(self.device)
         self.rgb_encoder = CLIPEncoder(self.device)
         self.space_pool_rgb = nn.Sequential(nn.AdaptiveAvgPool2d((1,1)), nn.Flatten(start_dim=2))
     
@@ -192,6 +195,18 @@ class ETP(Net):
             obs_view12['depth'] = depth_batch
             obs_view12['rgb'] = rgb_batch
             depth_embedding = self.depth_encoder(obs_view12)  # torch.Size([bs, 128, 4, 4])
+
+            new_image_list = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                futures = [executor.submit(process_image, tensor_image) for tensor_image in obs_view12['rgb']]
+                for future in concurrent.futures.as_completed(futures):
+                    new_image_list.append(future.result())
+
+            merged_array = np.stack(new_image_list, axis=0)
+            device = obs_view12['rgb'].device
+            tensor_image_back = torch.from_numpy(merged_array).to(device)
+            obs_view12['rgb'] = tensor_image_back
+
             rgb_embedding = self.rgb_encoder(obs_view12)      # torch.Size([bs, 2048, 7, 7])
 
             # 只使用rgb/depth

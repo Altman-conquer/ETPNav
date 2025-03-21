@@ -1,9 +1,14 @@
+import io
 
+import requests
 import torch
 import numpy as np
 import sys
 import glob
 import json
+
+from PIL import Image
+
 
 def neighborhoods(mu, x_range, y_range, sigma, circular_x=True, gaussian=False):
     """ Generate masks centered at mu of the given x and y range with the
@@ -100,3 +105,40 @@ def get_attention_mask(num_imgs=12, neighbor=1):
         t = np.roll(t, 1)
 
     return torch.from_numpy(mask).reshape(1,1,num_imgs,num_imgs).long()
+
+
+def send_image_for_inference(image_array, server_url: str = 'http://127.0.0.1:5000/inference'):
+    # Convert the numpy array to a PIL Image
+    image = Image.fromarray(image_array)
+
+    # Save the image to a BytesIO object
+    image_io = io.BytesIO()
+    image.save(image_io, format='PNG')
+    image_io.seek(0)
+
+    # Send the image to the server
+    files = {'image': image_io}
+    response = requests.post(server_url, files=files)
+
+    if response.status_code == 200:
+        image = Image.open(io.BytesIO(response.content))
+
+        # write to local
+        # with open('result.png', 'wb') as f:
+        #     f.write(response.content)
+
+        return image
+    else:
+        raise Exception(f"Failed to send image for inference. Status code: {response.status_code}")
+
+def process_image(tensor_image):
+    # Convert to NumPy array
+    numpy_image = tensor_image.cpu().detach().numpy()
+
+    # Convert to PIL Image and save
+    image = Image.fromarray(numpy_image)
+    # image.save('original_image.png')
+
+    # Process the image
+    new_image = send_image_for_inference(numpy_image)
+    return new_image

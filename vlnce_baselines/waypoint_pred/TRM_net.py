@@ -19,11 +19,15 @@ class BinaryDistPredictor_TRM(nn.Module):
         self.TRM_NEIGHBOR = 1
         self.HEATMAP_OFFSET = 5
 
-        # self.visual_fc_rgb = nn.Sequential(
-        #     nn.Flatten(),
-        #     nn.Linear(np.prod([2048,7,7]), hidden_dim),
-        #     nn.ReLU(True),
-        # )
+        self.rgb_and_depth = True
+
+        if self.rgb_and_depth:
+            self.visual_fc_rgb = nn.Sequential(
+                nn.Flatten(),
+                # nn.Linear(np.prod([2048,7,7]), hidden_dim),
+                nn.Linear(np.prod([512]), hidden_dim),
+                nn.ReLU(True),
+            )
         self.visual_fc_depth = nn.Sequential(
             nn.Flatten(),
             nn.Linear(np.prod([128,4,4]), hidden_dim),
@@ -43,11 +47,6 @@ class BinaryDistPredictor_TRM(nn.Module):
         config.num_hidden_layers = self.TRM_LAYER
         self.waypoint_TRM = WaypointBert(config=config)
 
-        layer_norm_eps = config.layer_norm_eps
-        self.mergefeats_LayerNorm = BertLayerNorm(
-            hidden_dim,
-            eps=layer_norm_eps
-        )
         self.mask = utils.get_attention_mask(
             num_imgs=self.num_imgs,
             neighbor=self.TRM_NEIGHBOR).to(self.device)
@@ -62,14 +61,18 @@ class BinaryDistPredictor_TRM(nn.Module):
     def forward(self, rgb_feats, depth_feats):
         bsi = rgb_feats.size(0) // self.num_imgs
 
-        # rgb_x = self.visual_fc_rgb(rgb_feats).reshape(
-        #     bsi, self.num_imgs, -1)
-        depth_x = self.visual_fc_depth(depth_feats).reshape(
-            bsi, self.num_imgs, -1)
-        # vis_x = self.visual_merge(
-        #     torch.cat((rgb_x, depth_x), dim=-1)
-        # )
-        vis_x = depth_x
+        if self.rgb_and_depth:
+            rgb_x = self.visual_fc_rgb(rgb_feats).reshape(
+                bsi, self.num_imgs, -1)
+            depth_x = self.visual_fc_depth(depth_feats).reshape(
+                bsi, self.num_imgs, -1)
+            vis_x = self.visual_merge(
+                torch.cat((rgb_x, depth_x), dim=-1)
+            )
+        else:
+            depth_x = self.visual_fc_depth(depth_feats).reshape(
+                bsi, self.num_imgs, -1)
+            vis_x = depth_x
 
         attention_mask = self.mask.repeat(bsi,1,1,1)
         vis_rel_x = self.waypoint_TRM(

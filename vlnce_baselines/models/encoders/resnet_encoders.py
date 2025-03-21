@@ -240,6 +240,34 @@ class TorchVisionResNet50(nn.Module):
             # )  # [BATCH x OUTPUT_DIM]
             return resnet_output
 
+# From waypoint predictor
+class RGBEncoder(nn.Module):
+    def __init__(self, device, resnet_pretrain=True, trainable=False):
+        super(RGBEncoder, self).__init__()
+        if resnet_pretrain:
+            print('\nLoading Torchvision pre-trained Resnet50 for RGB ...')
+        rgb_resnet = torchvision.models.resnet50(pretrained=resnet_pretrain)
+        rgb_modules = list(rgb_resnet.children())[:-2]
+        rgb_net = torch.nn.Sequential(*rgb_modules)
+        self.rgb_net = rgb_net
+        for param in self.rgb_net.parameters():
+            param.requires_grad_(trainable)
+
+        # self.scale = 0.5
+
+    def forward(self, observations):
+        rgb_observations = observations["rgb"].permute(0, 3, 1, 2)
+        rgb_observations = self.rgb_transform(rgb_observations)
+
+        rgb_shape = rgb_observations.size()
+        rgb_observations = rgb_observations.reshape(rgb_shape[0]*rgb_shape[1],
+                                    rgb_shape[2], rgb_shape[3], rgb_shape[4])
+        rgb_feats = self.rgb_net(rgb_observations.contiguous())  # * self.scale
+
+        # print('rgb_imgs', rgb_imgs.shape)
+        # print('rgb_feats', rgb_feats.shape)
+
+        return rgb_feats.squeeze()
 
 class CLIPEncoder(nn.Module):
     r"""
