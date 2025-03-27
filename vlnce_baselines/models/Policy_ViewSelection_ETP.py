@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+import pandas as pd
 
 from gym import Space
 from habitat import Config
@@ -196,16 +197,17 @@ class ETP(Net):
             obs_view12['rgb'] = rgb_batch
             depth_embedding = self.depth_encoder(obs_view12)  # torch.Size([bs, 128, 4, 4])
 
-            new_image_list = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(process_image, tensor_image) for tensor_image in obs_view12['rgb']]
-                for future in concurrent.futures.as_completed(futures):
-                    new_image_list.append(future.result())
+            if waypoint_predictor.rgb_and_depth is True:
+                new_image_list = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                    futures = [executor.submit(process_image, tensor_image) for tensor_image in obs_view12['rgb']]
+                    for future in concurrent.futures.as_completed(futures):
+                        new_image_list.append(future.result())
 
-            merged_array = np.stack(new_image_list, axis=0)
-            device = obs_view12['rgb'].device
-            tensor_image_back = torch.from_numpy(merged_array).to(device)
-            obs_view12['rgb'] = tensor_image_back
+                merged_array = np.stack(new_image_list, axis=0)
+                device = obs_view12['rgb'].device
+                tensor_image_back = torch.from_numpy(merged_array).to(device)
+                obs_view12['rgb'] = tensor_image_back
 
             rgb_embedding = self.rgb_encoder(obs_view12)      # torch.Size([bs, 2048, 7, 7])
 
@@ -244,6 +246,7 @@ class ETP(Net):
             batch_x_norm = batch_x_norm.reshape(
                 batch_size, NUM_ANGLES, NUM_CLASSES,
             )
+            # np.save('waypoint_prob.npy', batch_x_norm[0].cpu().detach().numpy())
             batch_x_norm_wrap = torch.cat((
                 batch_x_norm[:,-1:,:], 
                 batch_x_norm, 
@@ -253,6 +256,7 @@ class ETP(Net):
                 batch_x_norm_wrap.unsqueeze(1), 
                 max_predictions=5,
                 sigma=(7.0,5.0))
+            # np.save('waypoint_prob.npy', batch_output_map.cpu().detach().numpy())
 
             # predicted waypoints before sampling
             batch_output_map = batch_output_map.squeeze(1)[:,1:-1,:]

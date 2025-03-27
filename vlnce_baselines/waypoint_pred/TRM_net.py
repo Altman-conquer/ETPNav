@@ -19,7 +19,7 @@ class BinaryDistPredictor_TRM(nn.Module):
         self.TRM_NEIGHBOR = 1
         self.HEATMAP_OFFSET = 5
 
-        self.rgb_and_depth = True
+        self.rgb_and_depth = False
 
         if self.rgb_and_depth:
             self.visual_fc_rgb = nn.Sequential(
@@ -47,6 +47,12 @@ class BinaryDistPredictor_TRM(nn.Module):
         config.num_hidden_layers = self.TRM_LAYER
         self.waypoint_TRM = WaypointBert(config=config)
 
+        if not self.rgb_and_depth:
+            layer_norm_eps = config.layer_norm_eps
+            self.mergefeats_LayerNorm = BertLayerNorm(
+                hidden_dim,
+                eps=layer_norm_eps
+            )
         self.mask = utils.get_attention_mask(
             num_imgs=self.num_imgs,
             neighbor=self.TRM_NEIGHBOR).to(self.device)

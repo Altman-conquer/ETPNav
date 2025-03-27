@@ -644,6 +644,29 @@ def append_text_to_image(image: np.ndarray, text: str):
     final = np.concatenate((image, text_image), axis=0)
     return final
 
+def get_rgb_frame(observations):
+    cube = {}
+    for uuid in UUIDS_EQ:
+        cube[uuid] = deepcopy(observations[uuid])
+
+    # cube = {uuid: observations.pop(uuid) for uuid in UUIDS_EQ}
+    cube = {k: torch.from_numpy(v).unsqueeze(0) for k, v in cube.items()}
+    eq = CUBE2EQ(cube)
+    rgb = eq['rgbback'][0].numpy().copy()
+    return rgb
+
+def get_rgb_covered_frame(
+    observations,
+    info,
+    vis_info=None,
+    map_k="top_down_map_vlnce",
+):
+    """
+    获取RGB+圆点waypoint画面
+    """
+    rgb_frame = get_rgb_frame(observations)
+
+
 def planner_video_frame(
     observations,
     info,

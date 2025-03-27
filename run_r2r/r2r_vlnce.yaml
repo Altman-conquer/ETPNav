@@ -59,4 +59,4 @@ DATASET:
   SPLIT: train
   DATA_PATH: data/datasets/R2R_VLNCE_v1-2_preprocessed_BERTidx/{split}/{split}_bertidx.json.gz
   SCENES_DIR: data/scene_datasets/
-  CONTENT_SCENES: [ 'QUCTc6BB5sX' ] # split with '.' for multiple scenes
+#  CONTENT_SCENES: [ 'QUCTc6BB5sX' ] # split with '.' for multiple scenes
