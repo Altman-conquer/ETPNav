@@ -1,11 +1,16 @@
+import traceback
 import gc
 import os
 import sys
 import random
+import uuid
 import warnings
 from collections import defaultdict
+from concurrent.futures.thread import ThreadPoolExecutor
+from datetime import datetime
 from typing import Dict, List
 import jsonlines
+from loguru import logger as mylogger
 
 import cv2
 import lmdb
@@ -47,6 +52,8 @@ from vlnce_baselines.common.utils import dis_to_con, gather_list_and_concat
 from habitat_extensions.measures import NDTW, StepsTaken
 from fastdtw import fastdtw
 
+from .waypoint_pred.utils import split_instruction, query_qwen, BALL_COLORS, instruction_to_token, add_text_to_frame
+
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=FutureWarning)
     import tensorflow as tf  # noqa: F401
@@ -59,12 +66,18 @@ from torch.cuda.amp import autocast, GradScaler
 from vlnce_baselines.common.ops import pad_tensors_wgrad, gen_seq_masks
 from torch.nn.utils.rnn import pad_sequence
 
+mylogger.add("./data/logs/info.log", level="INFO", backtrace=True, diagnose=True)
+query_qwen_pool = ThreadPoolExecutor(max_workers=8)
+
+torch.autograd.set_detect_anomaly(True)
 
 @baseline_registry.register_trainer(name="SS-ETP")
 class RLTrainer(BaseVLNCETrainer):
     def __init__(self, config=None):
         super().__init__(config)
         self.max_len = int(config.IL.max_traj_len)  # * 0.97 transfered gt path got 0.96 spl
+
+        self.graph_map_memory = {} # {'scene_name': GraphMap}
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
@@ -200,6 +213,7 @@ class RLTrainer(BaseVLNCETrainer):
         self.waypoint_predictor = BinaryDistPredictor_TRM(device=self.device)
         cwp_fn = 'data/wp_pred/check_cwp_bestdist_hfov63' if self.config.MODEL.task_type == 'rxr' else 'data/wp_pred/check_cwp_bestdist_hfov90'
         # cwp_fn = 'data/wp_pred/semantic_check_val_best_avg_wayscore'
+        # cwp_fn = 'data/wp_pred/rgb_semantic_check_val_best_avg_wayscore'
         assert self.config.MODEL.task_type == 'r2r'
         self.waypoint_predictor.load_state_dict(
             torch.load(cwp_fn, map_location=torch.device('cpu'))['predictor']['state_dict'])
@@ -362,7 +376,26 @@ class RLTrainer(BaseVLNCETrainer):
 
             gmap_vp_ids = [None] + node_vp_ids + ghost_vp_ids
             gmap_step_ids = [0] + [gmap.node_stepId[vp] for vp in node_vp_ids] + [0] * len(ghost_vp_ids)
-            gmap_visited_masks = [0] + [1] * len(node_vp_ids) + [0] * len(ghost_vp_ids)
+
+            if gmap.merge_map:
+                node_vp_ids_int = [int(vp) for vp in node_vp_ids]
+                node_vp_ids_int.sort()
+
+                gmap_visited_masks = [0] + [0] * len(node_vp_ids) + [0] * len(ghost_vp_ids)
+
+                if len(node_vp_ids) > 0:
+                    for index, vp in enumerate(node_vp_ids_int):
+                        if index in gmap.visited_node:
+                            gmap_visited_masks[1 + index] = 1
+
+                    # for visited_node_index in gmap.visited_node:
+                    #     try:
+                    #         gmap_visited_masks[1 + visited_node_index] = 1
+                    #     except Exception as e:
+                    #         logger.error(f"Error in gmap_visited_masks: {e}, visited_node: {gmap.visited_node}, node_vp_ids: {node_vp_ids}")
+                    #         logger.error(traceback.format_exc())
+            else:
+                gmap_visited_masks = [0] + [1] * len(node_vp_ids) + [0] * len(ghost_vp_ids)
 
             gmap_img_fts = [gmap.get_node_embeds(vp) for vp in node_vp_ids] + \
                            [gmap.get_node_embeds(vp) for vp in ghost_vp_ids]
@@ -502,11 +535,16 @@ class RLTrainer(BaseVLNCETrainer):
         self.logs = defaultdict(list)
 
         for idx in pbar:
+            # for param in self.policy.parameters():
+            #     if param.grad is not None:
+            #         param.grad.zero_()
+
             self.optimizer.zero_grad()
             self.loss = 0.
 
             with autocast():
-                self.rollout('train', ml_weight, sample_ratio)
+                # self.rollout('train', ml_weight, sample_ratio)
+                self.customize_rollout_memory_between_episodes('train', ml_weight, sample_ratio)
             self.scaler.scale(self.loss).backward()  # self.loss.backward()
             self.scaler.step(self.optimizer)  # self.optimizer.step()
             self.scaler.update()
@@ -704,6 +742,7 @@ class RLTrainer(BaseVLNCETrainer):
             self.config,
             get_env_class(self.config.ENV_NAME),
             episodes_allowed=self.traj[::5] if self.config.EVAL.fast_eval else self.traj,
+            # episodes_allowed=['417'],
             auto_reset_done=False,  # unseen: 11006
         )
         dataset_length = sum(self.envs.number_of_episodes)
@@ -730,7 +769,9 @@ class RLTrainer(BaseVLNCETrainer):
         self.pbar = tqdm.tqdm(total=eps_to_eval) if self.config.use_pbar else None
 
         while len(self.stat_eps) < eps_to_eval:
-            self.customize_rollout('eval')
+        # while len(self.stat_eps) < 200:
+        #     self.customize_rollout('eval')
+            self.customize_rollout_memory_between_episodes('eval')
         self.envs.close()
 
         if self.world_size > 1:
@@ -1320,12 +1361,50 @@ class RLTrainer(BaseVLNCETrainer):
 
         self.envs.resume_all()
         observations = self.envs.reset()
+
+        # 指定episode进行测试
+        # assert self.envs.num_envs <= 1
+        current_episode_name = self.envs.call_at(0, "get_episode")['name']
+        # if current_episode_name != '2azQ1b91cZZ-1213':
+        #     mylogger.debug(f"skip episode: {current_episode_name}")
+        #     return #
+
+        # tmp_rgb = self.envs.call_at(0, "get_rgb_frame")
+        # tmp_depth = self.envs.call_at(0, "get_depth_frame")
+        # cv2.imwrite("tmp/depth.png",
+        #             cv2.normalize(tmp_depth[:, :, 0], None, 0, 65535, cv2.NORM_MINMAX).astype(np.uint16))
+
+
         instr_max_len = self.config.IL.max_text_len  # r2r 80, rxr 200
         instr_pad_id = 1 if self.config.MODEL.task_type == 'rxr' else 0
         observations = extract_instruction_tokens(observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
                                                   max_length=instr_max_len, pad_id=instr_pad_id)
         batch = batch_obs(observations, self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        use_llm = True
+        rgb_frame_history = [{} for _ in range(self.envs.num_envs)]
+        current_instruction_id = [1 for _ in range(self.envs.num_envs)]
+        vp_history = [{} for _ in range(self.envs.num_envs)]
+        llm_result = [{} for _ in range(self.envs.num_envs)]
+        different_vp = [[] for _ in range(self.envs.num_envs)]
+        insist_vp = [[] for _ in range(self.envs.num_envs)]
+        dir_name = ['' for _ in range(self.envs.num_envs)]
+
+        if not os.path.exists(f'tmp'):
+            os.makedirs(f'tmp')
+        for i in range(self.envs.num_envs):
+            dir_name[i] = self.envs.call_at(i, "get_episode")['name']
+
+            if not os.path.exists(f'tmp/{dir_name[i]}'):
+                os.makedirs(f'tmp/{dir_name[i]}')
+
+        if use_llm:
+            instructions = [instruction.instruction_text for instruction in self.envs.call(['get_instruction'] * self.envs.num_envs)]
+            split_instructions: list[str] = [split_instruction(instruction) for instruction in instructions]
+            split_atomic_instructions = [instructions.strip().split('\n') for instructions in split_instructions]
+            mylogger.info(f"Instruction: {instructions}")
+            mylogger.info(f"Split Instructions: {split_instructions}")
 
         if mode == 'eval':
             env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
@@ -1451,6 +1530,1272 @@ class RLTrainer(BaseVLNCETrainer):
                 raise NotImplementedError
             cpu_a_t = a_t.cpu().numpy()
 
+            try:
+                query_qwen_futures = []
+                for i, gmap in enumerate(self.gmaps):
+                    waypoint_color_mapping = self.envs.call_at(i, "add_object", {
+                        "ghost_positions": gmap.new_ghost_pos})
+
+                    new_ghost_nodes = list(gmap.new_ghost_pos.values())
+
+                    llm_result[i]['waypoint_color_mapping'] = waypoint_color_mapping
+                    llm_result[i]['new_ghost_nodes'] = new_ghost_nodes
+
+                    rgb_frame = self.envs.call_at(i, "get_rgb_frame", {"ghost_positions": new_ghost_nodes, 'flat': True})
+
+                    if stepk > 0: # mask image in the back of the agent
+                        # width = rgb_frame.shape[1]
+                        # black_width = int(width * 0.15)
+                        #
+                        # # 将左右两边各15%的区域设置为全黑色
+                        # rgb_frame[:, :black_width, :] = 0
+                        # rgb_frame[:, -black_width:, :] = 0
+
+                        width = rgb_frame.shape[1]
+                        black_width = int(width * 0.15)
+
+                        # Remove the left and right 15% of the image
+                        rgb_frame = rgb_frame[:, black_width:-black_width, :]
+
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    unique_id = uuid.uuid4()
+                    output_file_name = f'tmp/{dir_name[i]}/{timestamp}.png'
+                    cv2.imwrite(output_file_name, rgb_frame)
+                    rgb_frame_history[i][stepk] = output_file_name
+                    mylogger.info(f"save image to {output_file_name}")
+                    # print(f"save image to {output_file_name}")
+
+                    if False:
+                        pass
+                    # if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]:
+                    #     pass
+                    else:
+
+                        ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                        selected_waypoint_color = None
+                        if ghost_vp in gmap.new_ghost_pos:
+                            for color in waypoint_color_mapping.keys():
+                                if ghost_vp == waypoint_color_mapping[color]['vp_id']:
+                                    selected_waypoint_color = color
+                                    break
+                        llm_result[i]['selected_waypoint_color'] = selected_waypoint_color
+
+                        if use_llm:
+                            prompt = ''
+                            if stepk > 0:
+                                prompt += f"The first image is the previous step, and the second image is the current step. "
+                                prompt += f"In the previous step, the instruction is instruction {current_instruction_id[i] if llm_result[i]['current_goal_finished'] == 'yes' else current_instruction_id[i]}, and you choose the waypoint {llm_result[i]['waypoint_chosen'] if llm_result[i]['waypoint_chosen'] != 'unknown' else llm_result[i]['etp_selected_waypoint_color']}. "
+                            prompt += f"There are {len(gmap.new_ghost_pos)} waypoint in the image, their color are {BALL_COLORS[:len(new_ghost_nodes)]}, respectively. Be aware that some waypoint might not be visible in the current image. "
+                            prompt += (f"Your instructions are {split_instructions[i]}\n"
+                                       f"You are currently at instruction {current_instruction_id[i]}, which means your current goal is {split_atomic_instructions[i][current_instruction_id[i] - 1]}")
+                            prompt += f"You need to tell whether the current goal is finished, "
+
+                            if current_instruction_id[i] == len(split_atomic_instructions[i]):
+                                prompt += (
+                                    f"if it is, you don't need to choose any waypoint since all instructions are finished and output the Waypoint chosen in the answer to be 'unneeded', "
+                                    f"if not, you need to tell the color of the waypoint you should go to that can finish instruction {current_instruction_id[i]}. "
+                                )
+                            else:
+                                prompt += (
+                                    f"if it is, you need to switch to the instruction {current_instruction_id[i] + 1} ({split_atomic_instructions[i][current_instruction_id[i]]}) and choose waypoint that can finish instruction {current_instruction_id[i] + 1}, "
+                                    f"if not, you need to tell the color of the waypoint you should go to that can finish instruction {current_instruction_id[i]}. "
+                                    f"you also need to check if the place described in the next instruction appears in the image, if so, you can also switch to the next instruction with current goal finished. "
+                                )
+
+                            # prompt += '\nIf the instruction requires you to stop after reaching something, such as "Stop once you reach the bed," you should keep moving until close enough to the target object. \n'
+                            prompt += 'If the instruction requires you to stop after reaching something, such as "Stop once you reach the bed," you should keep moving until there are no closer waypoints to choose. '
+                            prompt += "You need to output all waypoint color that you can see in current image, if you can't see any waypoint in the image, please output \"unknown\" when choosing waypoint. \n"
+
+                            if selected_waypoint_color is None:
+                                prompt += (
+                                    f"In addition, if you cannot decide which waypoint to choose, output the Waypoint chosen in the answer to be 'unknown'."
+                                )
+
+                                if current_instruction_id[i] == len(split_atomic_instructions[i]):
+                                    prompt += (
+                                        f"Answer in format:"
+                                        f"Analysis: <analysis>, "
+                                        f"Current goal finished: <yes/no>, "
+                                        f"Waypoint color visible: [red, green, blue, yellow, purple], " # 'red', 'green', 'blue', 'yellow', 'purple'
+                                        f"Waypoint chosen: <waypoint color/unknown/unneeded>, "
+                                    )
+                                else:
+                                    prompt += (
+                                        f"Answer in format:"
+                                        f"Analysis: <analysis>, "
+                                        f"Current goal finished: <yes/no>, "
+                                        f"Waypoint color visible: [red, green, blue, yellow, purple], "
+                                        f"Waypoint chosen: <waypoint color>, "
+                                    )
+                            else:
+                                prompt += (
+                                    f"In addition, the waypoint selected by an expert is in color {selected_waypoint_color}. "
+                                    f"If the waypoint you choose is the same as the expert, please analyze why it is correct. "
+                                    f"If it is not the same, then please analyze why it is wrong and give the waypoint you choose. "
+                                    f"If you cannot decide which waypoint to choose, please choose the waypoint selected by the expert. "
+                                )
+
+                                if current_instruction_id[i] == len(split_atomic_instructions[i]):
+                                    prompt += (
+                                        f"Answer in format:"
+                                        f"Analysis: <analysis>, "
+                                        f"Current goal finished: <yes/no>, "
+                                        f"Waypoint color visible: [red, green, blue, yellow, purple], "
+                                        f"Waypoint chosen: <waypoint color/unneeded>, "
+                                    )
+                                else:
+                                    prompt += (
+                                        f"Answer in format:"
+                                        f"Analysis: <analysis>, "
+                                        f"Current goal finished: <yes/no>, "
+                                        f"Waypoint color visible: [red, green, blue, yellow, purple], "
+                                        f"Waypoint chosen: <waypoint color>, "
+                                    )
+
+
+                            if stepk > 0:
+                                qwen_image_paths = [
+                                    os.path.join(os.getcwd(), rgb_frame_history[i][stepk - 1]),
+                                    os.path.join(os.getcwd(), output_file_name)]
+                            else:
+                                qwen_image_paths = [os.path.join(os.getcwd(), output_file_name)]
+                            mylogger.info(f"Query Qwen, image_paths: {qwen_image_paths}, Prompt: \n {prompt}")
+
+                            # result = query_qwen(qwen_image_paths, prompt)
+                            query_qwen_futures.append(query_qwen_pool.submit(query_qwen, qwen_image_paths, prompt))
+
+
+                        # self.envs.call_at(i, "remove_object")
+
+                for i, gmap in enumerate(self.gmaps):
+                    new_ghost_nodes = llm_result[i]['new_ghost_nodes']
+                    selected_waypoint_color = llm_result[i]['selected_waypoint_color']
+
+                    result = query_qwen_futures[i].result()
+
+                    # parse the result
+                    try:
+                        analysis = result.split("Analysis: ")[1].split("Current goal finished:")[0]
+                        current_goal_finished = result.split("Current goal finished: ")[1].split(",")[0].split('\n')[
+                            0].lower().strip()
+                    except Exception as e:
+                        mylogger.error(f"error when split result: {result}")
+                        mylogger.error(traceback.format_exc())
+                        analysis = ''
+                        current_goal_finished = 'no'
+
+                    try:
+                        waypoint_visible = \
+                        result.split("Waypoint color visible: ")[1].split('\n')[0].strip().split("Waypoint chosen: ")[
+                            0].strip(', [].').split(',')
+                        waypoint_visible = [waypoint.strip() for waypoint in waypoint_visible]
+                    except:
+                        mylogger.error(
+                            f"error when split waypoint_visible: {result.split('Waypoint color visible: ')[1]}")
+                        waypoint_visible = []
+                        mylogger.error(traceback.format_exc())
+
+                    try:
+                        waypoint_chosen = \
+                        result.split("Waypoint chosen: ")[1].split(",")[0].split('\n')[0].lower().strip().split(' ')[0]
+                    except Exception as e:
+                        mylogger.error(f"error when split waypoint_chosen: {result.split('Waypoint chosen: ')[1]}")
+                        mylogger.error(traceback.format_exc())
+                        waypoint_chosen = 'unknown'
+
+                    mylogger.info(
+                        f"Analysis: {analysis}\n"
+                        f"Current goal finished: {current_goal_finished}\n"
+                        f"Waypoint put in scene: {BALL_COLORS[:len(new_ghost_nodes)]}\n"
+                        f"Waypoint color visible: {waypoint_visible}\n"
+                        f"Waypoint chosen: {waypoint_chosen}\n"
+                        f"Waypoint chosen valid: {waypoint_chosen in waypoint_visible}\n"
+                        f"Waypoint chosen same as expert: {waypoint_chosen == selected_waypoint_color}\n"
+                    )
+                    # print(f"Analysis: {analysis}")
+                    # print(f"Current goal finished: {current_goal_finished}")
+                    # print(f"Waypoint chosen: {waypoint_chosen}")
+                    # print(f"Waypoint chosen same as expert: {waypoint_chosen == selected_waypoint_color}")
+
+                    if current_goal_finished not in ['yes', 'no']:
+                        mylogger.error(f"current_goal_finished should be yes or no, but got {current_goal_finished}")
+                        current_goal_finished = 'no'
+
+                    if waypoint_chosen not in BALL_COLORS[:len(new_ghost_nodes)] and waypoint_chosen not in ['unknown',
+                                                                                                             'unneeded']:
+                        mylogger.error(
+                            f"waypoint_chosen should be in {BALL_COLORS[:len(new_ghost_nodes)]}, but got {waypoint_chosen}")
+                        waypoint_chosen = 'unknown'
+                    elif waypoint_chosen not in waypoint_visible and waypoint_chosen not in ['unknown', 'unneeded']:
+                        mylogger.error(
+                            f"waypoint_chosen should be in waypoint_visible {waypoint_visible}, but got {waypoint_chosen}")
+                        waypoint_chosen = 'unknown'
+
+                    # assert current_goal_finished in ['yes', 'no'], f"current_goal_finished should be yes or no, but got {current_goal_finished}"
+                    # assert waypoint_chosen in BALL_COLORS[:len(new_ghost_nodes)] or waypoint_chosen in ['unknown', 'unneeded'], f"waypoint_chosen should be in {BALL_COLORS[:len(new_ghost_nodes)]}, but got {waypoint_chosen}"
+                    if current_goal_finished == 'yes':
+                        current_instruction_id[i] = current_instruction_id[i] + 1
+
+                    llm_result[i]['analysis'] = analysis
+                    llm_result[i]['current_goal_finished'] = current_goal_finished
+                    llm_result[i]['waypoint_chosen'] = waypoint_chosen
+                    llm_result[i][
+                        'etp_selected_waypoint_color'] = selected_waypoint_color if selected_waypoint_color in waypoint_visible else 'unknown'
+                    llm_result[i]['waypoint_chosen_same_as_expert'] = waypoint_chosen == selected_waypoint_color
+
+                # make equiv action
+                env_actions = []
+                use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING)
+                for i, gmap in enumerate(self.gmaps):
+                    # if llm_result[i]['waypoint_chosen'] == 'unneeded' or llm_result[i]['waypoint_chosen'] == 'unknown':
+                    #     print('123')
+
+                    if (llm_result[i]['waypoint_chosen'] == 'unneeded' and current_instruction_id[i] >= len(
+                            split_atomic_instructions[i])) \
+                            or (current_instruction_id[i] > len(split_atomic_instructions[i])) \
+                            or (llm_result[i]['waypoint_chosen'] == 'unknown' and (
+                            cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i])):
+                        stop_vp = vp_history[i][stepk - 1]
+                        stop_pos = gmap.ghost_aug_pos[stop_vp]
+                        _, front_vp = gmap.front_to_ghost_dist(stop_vp)
+                        front_pos = gmap.node_pos[front_vp]
+
+                        # if self.config.IL.back_algo == 'control':
+                        #     back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][front_vp]]
+                        #     back_path = back_path[1:]
+                        # else:
+                        #     back_path = None
+                        back_path = None
+
+                        # vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
+                        # stop_scores = [s[1] for s in vp_stop_scores]
+                        # stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                        # stop_pos = gmap.node_pos[stop_vp]
+                        # if self.config.IL.back_algo == 'control':
+                        #     back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
+                        #     back_path = back_path[1:]
+                        # else:
+                        #     back_path = None
+
+                        vis_info = {
+                            'nodes': list(gmap.node_pos.values()),
+                            'ghosts': list(gmap.ghost_aug_pos.values()),
+                            'predict_ghost': stop_pos,
+                            'stop_by': 'llm',
+                            'different_vp': different_vp[i],
+                            'insist_vp': insist_vp[i],
+                        }
+                        # print('action 0')
+                        env_actions.append(
+                            {
+                                'action': {
+                                    'act': 0,
+                                    'cur_vp': cur_vp[i],
+                                    'stop_vp': stop_vp, 'stop_pos': stop_pos,
+                                    'back_path': back_path,
+                                    'tryout': use_tryout,
+                                },
+                                'vis_info': vis_info,
+                            }
+                        )
+
+                        mylogger.info(f"Stop by llm")
+                    elif (cpu_a_t[i] == 0 and llm_result[i]['waypoint_chosen'] == 'unknown') or stepk == self.max_len - 1 or no_vp_left[i]:
+                        # stop at node with max stop_prob
+                        vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
+                        stop_scores = [s[1] for s in vp_stop_scores]
+                        stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                        stop_pos = gmap.node_pos[stop_vp]
+                        if self.config.IL.back_algo == 'control':
+                            back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
+                            back_path = back_path[1:]
+                        else:
+                            back_path = None
+                        vis_info = {
+                            'nodes': list(gmap.node_pos.values()),
+                            'ghosts': list(gmap.ghost_aug_pos.values()),
+                            'predict_ghost': stop_pos,
+                            'stop_by': 'etpnav',
+                            'different_vp': different_vp[i],
+                            'insist_vp': insist_vp[i],
+                        }
+                        # print('action 0')
+
+                        env_actions.append(
+                            {
+                                'action': {
+                                    'act': 0,
+                                    'cur_vp': cur_vp[i],
+                                    'stop_vp': stop_vp, 'stop_pos': stop_pos,
+                                    'back_path': back_path,
+                                    'tryout': use_tryout,
+                                },
+                                'vis_info': vis_info,
+                            }
+                        )
+
+                        mylogger.info(f"Stop by etpnav")
+                    else:
+                        # ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                        # ghost_vp = llm_result[i]['waypoint_color_mapping'][llm_result[i]['waypoint_chosen']]['vp_id']
+
+                        if llm_result[i]['waypoint_chosen_same_as_expert'] or llm_result[i]['waypoint_chosen'] == 'unknown':
+                            ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                        # elif nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]] == llm_result[i].get('prev_etp_vp') and llm_result[i].get('prev_etp_vp') is not None:
+                        #     ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                        #     if llm_result[i]['waypoint_chosen_same_as_expert'] is False and llm_result[i]['waypoint_chosen'] != 'unknown':
+                        #         try:
+                        #             insist_vp[i].append(gmap.ghost_aug_pos[llm_result[i]['waypoint_color_mapping'][
+                        #                 llm_result[i]['waypoint_chosen']]['vp_id']])
+                        #         except Exception as e:
+                        #             mylogger.error(traceback.format_exc())
+                        else:
+                            ghost_vp = llm_result[i]['waypoint_color_mapping'][llm_result[i]['waypoint_chosen']]['vp_id']
+
+                            etp_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                            if etp_vp is not None and etp_vp in gmap.ghost_aug_pos:
+                                different_vp[i].append(gmap.ghost_aug_pos[etp_vp])
+
+                        llm_result[i]['prev_etp_vp'] = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+
+                        if ghost_vp is None:
+                            mylogger.error(f"ghost_vp is None, cpu_a_t: {cpu_a_t[i]}, ghost_vp: {ghost_vp}, waypoint_color_mapping: {llm_result[i]['waypoint_color_mapping']}")
+
+                        vp_history[i][stepk] = ghost_vp
+                        ghost_pos = gmap.ghost_aug_pos[ghost_vp]
+                        _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
+                        front_pos = gmap.node_pos[front_vp]
+
+                        if self.config.VIDEO_OPTION:
+                            teacher_action_cpu = teacher_actions[i].cpu().item()
+                            if teacher_action_cpu in [0, -100]:
+                                teacher_ghost = None
+                            else:
+                                teacher_ghost = gmap.ghost_aug_pos[nav_inputs['gmap_vp_ids'][i][teacher_action_cpu]]
+                            vis_info = {
+                                'nodes': list(gmap.node_pos.values()),
+                                'ghosts': list(gmap.ghost_aug_pos.values()),
+                                'predict_ghost': ghost_pos,
+                                'teacher_ghost': teacher_ghost,
+                                'different_vp': different_vp[i],
+                                'insist_vp': insist_vp[i],
+                            }
+                        else:
+                            vis_info = None
+                        # teleport to front, then forward to ghost
+                        if self.config.IL.back_algo == 'control':
+                            back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][front_vp]]
+                            back_path = back_path[1:]
+                        else:
+                            back_path = None
+                        # print('action 4')
+                        env_actions.append(
+                            {
+                                'action': {
+                                    'act': 4,
+                                    'cur_vp': cur_vp[i],
+                                    'front_vp': front_vp, 'front_pos': front_pos,
+                                    'ghost_vp': ghost_vp, 'ghost_pos': ghost_pos,
+                                    'back_path': back_path,
+                                    'tryout': use_tryout,
+                                },
+                                'vis_info': vis_info,
+                            }
+                        )
+
+                        prev_vp[i] = front_vp
+                        if self.config.MODEL.consume_ghost:
+                            gmap.delete_ghost(ghost_vp)
+
+
+                    # assert self.envs.num_envs <= 1:
+                        # frame = self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info})
+                        # rgb_frame = self.envs.call_at(0, "get_rgb_frame", {"ghost_positions": list(gmap.new_ghost_pos.values())})
+                        # waypoint_nms = wp_outputs['waypoint_nms'][0].detach().cpu().numpy()
+                        #
+                        # np.save('tmp/waypoint_nms.npy', waypoint_nms)
+                        # cv2.imwrite(f'tmp/{current_episode_name}/{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}-waypoint.png', self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info, "append_frame": False}))
+                        # cv2.imwrite('tmp/rgb.png', rgb_frame)
+
+                outputs = self.envs.step(env_actions)
+
+                for i in range(len(self.gmaps)):
+                    self.envs.call_at(i, "remove_object")
+
+                observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+
+            except Exception as e:
+                mylogger.error(traceback.format_exc())
+
+
+            # calculate metric
+            if mode == 'eval':
+                curr_eps = self.envs.current_episodes()
+                for i in range(self.envs.num_envs):
+                    if not dones[i]:
+                        continue
+                    info = infos[i]
+                    ep_id = curr_eps[i].episode_id
+                    gt_path = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float)
+                    pred_path = np.array(info['position']['position'])
+                    distances = np.array(info['position']['distance'])
+                    metric = {}
+                    metric['steps_taken'] = info['steps_taken']
+                    metric['distance_to_goal'] = distances[-1]
+                    metric['success'] = 1. if distances[-1] <= 3. else 0.
+                    metric['oracle_success'] = 1. if (distances <= 3.).any() else 0.
+                    metric['path_length'] = float(np.linalg.norm(pred_path[1:] - pred_path[:-1], axis=1).sum())
+                    metric['collisions'] = info['collisions']['count'] / len(pred_path)
+                    gt_length = distances[0]
+                    metric['spl'] = metric['success'] * gt_length / max(gt_length, metric['path_length'])
+                    dtw_distance = fastdtw(pred_path, gt_path, dist=NDTW.euclidean_distance)[0]
+                    metric['ndtw'] = np.exp(-dtw_distance / (len(gt_path) * 3.))
+                    metric['sdtw'] = metric['ndtw'] * metric['success']
+                    metric['ghost_cnt'] = self.gmaps[i].ghost_cnt
+                    self.stat_eps[ep_id] = metric
+                    self.pbar.update()
+
+            # record path
+            if mode == 'infer':
+                curr_eps = self.envs.current_episodes()
+                for i in range(self.envs.num_envs):
+                    if not dones[i]:
+                        continue
+                    info = infos[i]
+                    ep_id = curr_eps[i].episode_id
+                    self.path_eps[ep_id] = [
+                        {
+                            'position': info['position_infer']['position'][0],
+                            'heading': info['position_infer']['heading'][0],
+                            'stop': False
+                        }
+                    ]
+                    for p, h in zip(info['position_infer']['position'][1:], info['position_infer']['heading'][1:]):
+                        if p != self.path_eps[ep_id][-1]['position']:
+                            self.path_eps[ep_id].append({
+                                'position': p,
+                                'heading': h,
+                                'stop': False
+                            })
+                    self.path_eps[ep_id] = self.path_eps[ep_id][:500]
+                    self.path_eps[ep_id][-1]['stop'] = True
+                    self.pbar.update()
+
+            # pause env
+            if sum(dones) > 0:
+                for i in reversed(list(range(self.envs.num_envs))):
+                    if dones[i]:
+                        # from etpnav
+                        not_done_index.pop(i)
+                        self.envs.pause_at(i)
+                        observations.pop(i)
+                        # graph stop
+                        self.gmaps.pop(i)
+                        prev_vp.pop(i)
+
+                        # from customize
+                        rgb_frame_history.pop(i)
+                        current_instruction_id.pop(i)
+                        vp_history.pop(i)
+                        llm_result.pop(i)
+                        different_vp.pop(i)
+                        insist_vp.pop(i)
+                        dir_name.pop(i)
+                        instructions.pop(i)
+                        split_instructions.pop(i)
+                        split_atomic_instructions.pop(i)
+
+            if self.envs.num_envs == 0:
+                break
+
+            # obs for next step
+            observations = extract_instruction_tokens(observations,
+                                                      self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID)
+            batch = batch_obs(observations, self.device)
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if mode == 'train':
+            loss = ml_weight * loss / total_actions
+            self.loss += loss
+            self.logs['IL_loss'].append(loss.item())
+
+    # 将分割后的指令发给etpnav
+    def customize_rollout_etp_atomic_instruction(self, mode, ml_weight=None, sample_ratio=None):
+        if mode == 'train':
+            feedback = 'sample'
+        elif mode == 'eval' or mode == 'infer':
+            feedback = 'argmax'
+        else:
+            raise NotImplementedError
+
+        self.envs.resume_all()
+        observations = self.envs.reset()
+
+
+        use_llm = False
+        rgb_frame_history = [{} for _ in range(self.envs.num_envs)]
+        current_instruction_id = [1 for _ in range(self.envs.num_envs)]
+        vp_history = [{} for _ in range(self.envs.num_envs)]
+        llm_result = [{} for _ in range(self.envs.num_envs)]
+        different_vp = [[] for _ in range(self.envs.num_envs)]
+        insist_vp = [[] for _ in range(self.envs.num_envs)]
+        dir_name = ['' for _ in range(self.envs.num_envs)]
+
+        if not os.path.exists(f'tmp'):
+            os.makedirs(f'tmp')
+        for i in range(self.envs.num_envs):
+            dir_name[i] = self.envs.call_at(i, "get_episode")['name']
+
+            if not os.path.exists(f'tmp/{dir_name[i]}'):
+                os.makedirs(f'tmp/{dir_name[i]}')
+
+        instructions = [instruction.instruction_text for instruction in self.envs.call(['get_instruction'] * self.envs.num_envs)]
+        split_instructions: list[str] = [split_instruction(instruction) for instruction in instructions]
+        split_atomic_instructions = [instructions.strip().split('\n') for instructions in split_instructions]
+        incremental_instructions = [
+            ['\n'.join(split_atomic_instruction[:i + 1]) for i in range(len(split_atomic_instruction))]
+            for split_atomic_instruction in split_atomic_instructions
+        ]
+        incremental_instructions_token = [
+            [instruction_to_token(instruction) for instruction in incremental_instruction]
+            for incremental_instruction in incremental_instructions
+        ]
+
+        mylogger.info(f"Instruction: {instructions}")
+        mylogger.info(f"Split Instructions: {split_instructions}")
+
+        # 指定episode进行测试
+        # assert self.envs.num_envs <= 1
+        current_episode_name = self.envs.call_at(0, "get_episode")['name']
+        # if current_episode_name != '2azQ1b91cZZ-1213':
+        #     mylogger.debug(f"skip episode: {current_episode_name}")
+        #     return #
+
+
+        instr_max_len = self.config.IL.max_text_len  # r2r 80, rxr 200
+        instr_pad_id = 1 if self.config.MODEL.task_type == 'rxr' else 0
+        observations = extract_instruction_tokens(observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
+                                                  max_length=instr_max_len, pad_id=instr_pad_id)
+        for i in range(len(observations)):
+            observations[i]['instruction'] = incremental_instructions_token[i][current_instruction_id[i] - 1]
+
+
+        batch = batch_obs(observations, self.device)
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if mode == 'eval':
+            env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
+                            if ep.episode_id in self.stat_eps]
+            self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
+            if self.envs.num_envs == 0: return
+        if mode == 'infer':
+            env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
+                            if ep.episode_id in self.path_eps]
+            self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
+            if self.envs.num_envs == 0: return
+            curr_eps = self.envs.current_episodes()
+            for i in range(self.envs.num_envs):
+                if self.config.MODEL.task_type == 'rxr':
+                    ep_id = curr_eps[i].episode_id
+                    k = curr_eps[i].instruction.instruction_id
+                    self.inst_ids[ep_id] = int(k)
+
+        loss = 0.
+        total_actions = 0.
+        not_done_index = list(range(self.envs.num_envs))
+
+        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION)
+        ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
+        self.gmaps = [GraphMap(have_real_pos,
+                               self.config.IL.loc_noise,
+                               self.config.MODEL.merge_ghost,
+                               ghost_aug) for _ in range(self.envs.num_envs)]
+        prev_vp = [None] * self.envs.num_envs
+
+        for stepk in range(self.max_len):
+            total_actions += self.envs.num_envs
+
+            while True:
+                # encode instructions
+                all_txt_ids = batch['instruction']
+                all_txt_masks = (all_txt_ids != instr_pad_id)
+                all_txt_embeds = self.policy.net(
+                    mode='language',
+                    txt_ids=all_txt_ids,
+                    txt_masks=all_txt_masks,
+                )
+
+                txt_masks = all_txt_masks[not_done_index]
+                txt_embeds = all_txt_embeds[not_done_index]
+
+                # cand waypoint prediction
+                wp_outputs = self.policy.net(
+                    mode="waypoint",
+                    waypoint_predictor=self.waypoint_predictor,
+                    observations=batch,
+                    in_train=(mode == 'train' and self.config.IL.waypoint_aug),
+                )
+
+                # pano encoder
+                vp_inputs = self._vp_feature_variable(wp_outputs)
+                vp_inputs.update({
+                    'mode': 'panorama',
+                })
+                pano_embeds, pano_masks = self.policy.net(**vp_inputs)
+                avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
+                                  torch.sum(pano_masks, 1, keepdim=True)
+
+                # get vp_id, vp_pos of cur_node and cand_ndoe
+                cur_pos, cur_ori = self.get_pos_ori()
+                cur_vp, cand_vp, cand_pos = [], [], []
+                for i in range(self.envs.num_envs):
+                    cur_vp_i, cand_vp_i, cand_pos_i = self.gmaps[i].identify_node(
+                        cur_pos[i], cur_ori[i], wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i]
+                    )
+                    cur_vp.append(cur_vp_i)
+                    cand_vp.append(cand_vp_i)
+                    cand_pos.append(cand_pos_i)
+
+                if mode == 'train' or self.config.VIDEO_OPTION:
+                    cand_real_pos = []
+                    for i in range(self.envs.num_envs):
+                        cand_real_pos_i = [
+                            self.envs.call_at(i, "get_cand_real_pos", {"angle": ang, "forward": dis})
+                            for ang, dis in zip(wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i])
+                        ]
+                        cand_real_pos.append(cand_real_pos_i)
+                else:
+                    cand_real_pos = [None] * self.envs.num_envs
+
+                for i in range(self.envs.num_envs):
+                    cur_embeds = avg_pano_embeds[i]
+                    cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i] == 1]
+                    self.gmaps[i].update_graph(prev_vp[i], stepk + 1,
+                                               cur_vp[i], cur_pos[i], cur_embeds,
+                                               cand_vp[i], cand_pos[i], cand_embeds,
+                                               cand_real_pos[i])
+
+                nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)
+                nav_inputs.update({
+                    'mode': 'navigation',
+                    'txt_embeds': txt_embeds,
+                    'txt_masks': txt_masks,
+                })
+                no_vp_left = nav_inputs.pop('no_vp_left')
+                nav_outs = self.policy.net(**nav_inputs)
+                nav_logits = nav_outs['global_logits']
+                nav_probs = F.softmax(nav_logits, 1)
+                for i, gmap in enumerate(self.gmaps):
+                    gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item()
+
+                # random sample demo
+                # logits = torch.randn(nav_inputs['gmap_masks'].shape).cuda()
+                # logits.masked_fill_(~nav_inputs['gmap_masks'], -float('inf'))
+                # logits.masked_fill_(nav_inputs['gmap_visited_masks'], -float('inf'))
+
+                # determine action
+                if feedback == 'sample':
+                    c = torch.distributions.Categorical(nav_probs)
+                    a_t = c.sample().detach()
+                    a_t = torch.where(torch.rand_like(a_t, dtype=torch.float) <= sample_ratio, teacher_actions, a_t)
+                elif feedback == 'argmax':
+                    a_t = nav_logits.argmax(dim=-1)
+                else:
+                    raise NotImplementedError
+                cpu_a_t = a_t.cpu().numpy()
+
+                tag = False
+                for i, gmap in enumerate(self.gmaps):
+                    if cpu_a_t[i] == 0 and current_instruction_id[i] < len(split_atomic_instructions[i]) - 1:
+                        observations[i]['instruction'] = incremental_instructions_token[i][current_instruction_id[i]]
+                        current_instruction_id[i] += 1
+                        tag = True
+
+                if tag:
+                    batch = batch_obs(observations, self.device)
+                    batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+                else:
+                    break
+
+            if mode == 'train' or self.config.VIDEO_OPTION:
+                teacher_actions = self._teacher_action_new(nav_inputs['gmap_vp_ids'], no_vp_left)
+            if mode == 'train':
+                loss += F.cross_entropy(nav_logits, teacher_actions, reduction='sum', ignore_index=-100)
+
+            try:
+                if use_llm:
+                    query_qwen_futures = []
+                    for i, gmap in enumerate(self.gmaps):
+                        waypoint_color_mapping = self.envs.call_at(i, "add_object", {
+                            "ghost_positions": gmap.new_ghost_pos})
+
+                        new_ghost_nodes = list(gmap.new_ghost_pos.values())
+
+                        llm_result[i]['waypoint_color_mapping'] = waypoint_color_mapping
+                        llm_result[i]['new_ghost_nodes'] = new_ghost_nodes
+
+                        rgb_frame = self.envs.call_at(i, "get_rgb_frame", {"ghost_positions": new_ghost_nodes, 'flat': True})
+
+                        if stepk > 0: # mask image in the back of the agent
+                            # width = rgb_frame.shape[1]
+                            # black_width = int(width * 0.15)
+                            #
+                            # # 将左右两边各15%的区域设置为全黑色
+                            # rgb_frame[:, :black_width, :] = 0
+                            # rgb_frame[:, -black_width:, :] = 0
+
+                            width = rgb_frame.shape[1]
+                            black_width = int(width * 0.15)
+
+                            # Remove the left and right 15% of the image
+                            rgb_frame = rgb_frame[:, black_width:-black_width, :]
+
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        unique_id = uuid.uuid4()
+                        output_file_name = f'tmp/{dir_name[i]}/{timestamp}.png'
+                        cv2.imwrite(output_file_name, rgb_frame)
+                        rgb_frame_history[i][stepk] = output_file_name
+                        mylogger.info(f"save image to {output_file_name}")
+                        # print(f"save image to {output_file_name}")
+
+                        ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                        selected_waypoint_color = None
+                        if ghost_vp in gmap.new_ghost_pos:
+                            for color in waypoint_color_mapping.keys():
+                                if ghost_vp == waypoint_color_mapping[color]['vp_id']:
+                                    selected_waypoint_color = color
+                                    break
+                        llm_result[i]['selected_waypoint_color'] = selected_waypoint_color
+
+                        prompt = ''
+                        if stepk > 0:
+                            prompt += f"The first image is the previous step, and the second image is the current step. "
+                            prompt += f"In the previous step, the instruction is instruction {current_instruction_id[i] if llm_result[i]['current_goal_finished'] == 'yes' else current_instruction_id[i]}, and you choose the waypoint {llm_result[i]['waypoint_chosen'] if llm_result[i]['waypoint_chosen'] != 'unknown' else llm_result[i]['etp_selected_waypoint_color']}. "
+                        prompt += f"There are {len(gmap.new_ghost_pos)} waypoint in the image, their color are {BALL_COLORS[:len(new_ghost_nodes)]}, respectively. Be aware that some waypoint might not be visible in the current image. "
+                        prompt += (f"Your instructions are {split_instructions[i]}\n"
+                                   f"You are currently at instruction {current_instruction_id[i]}, which means your current goal is {split_atomic_instructions[i][current_instruction_id[i] - 1]}")
+                        prompt += f"You need to tell whether the current goal is finished, "
+
+                        if current_instruction_id[i] == len(split_atomic_instructions[i]):
+                            prompt += (
+                                f"if it is, you don't need to choose any waypoint since all instructions are finished and output the Waypoint chosen in the answer to be 'unneeded', "
+                                f"if not, you need to tell the color of the waypoint you should go to that can finish instruction {current_instruction_id[i]}. "
+                            )
+                        else:
+                            prompt += (
+                                f"if it is, you need to switch to the instruction {current_instruction_id[i] + 1} ({split_atomic_instructions[i][current_instruction_id[i]]}) and choose waypoint that can finish instruction {current_instruction_id[i] + 1}, "
+                                f"if not, you need to tell the color of the waypoint you should go to that can finish instruction 1. "
+                                f"you also need to check if the place described in the next instruction appears in the image, if so, you can also switch to the next instruction with current goal finished. "
+                            )
+
+                        # prompt += '\nIf the instruction requires you to stop after reaching something, such as "Stop once you reach the bed," you should keep moving until close enough to the target object. \n'
+                        prompt += 'If the instruction requires you to stop after reaching something, such as "Stop once you reach the bed," you should keep moving until there are no closer waypoints to choose. '
+                        prompt += "You need to output all waypoint color that you can see in current image, if you can't see any waypoint in the image, please output \"unknown\" when choosing waypoint. \n"
+
+                        if selected_waypoint_color is None:
+                            prompt += (
+                                f"In addition, if you cannot decide which waypoint to choose, output the Waypoint chosen in the answer to be 'unknown'."
+                            )
+
+                            if current_instruction_id[i] == len(split_atomic_instructions[i]):
+                                prompt += (
+                                    f"Answer in format:"
+                                    f"Analysis: <analysis>, "
+                                    f"Current goal finished: <yes/no>, "
+                                    f"Waypoint color visible: [red, green, blue, yellow, purple], " # 'red', 'green', 'blue', 'yellow', 'purple'
+                                    f"Waypoint chosen: <waypoint color/unknown/unneeded>, "
+                                )
+                            else:
+                                prompt += (
+                                    f"Answer in format:"
+                                    f"Analysis: <analysis>, "
+                                    f"Current goal finished: <yes/no>, "
+                                    f"Waypoint color visible: [red, green, blue, yellow, purple], "
+                                    f"Waypoint chosen: <waypoint color>, "
+                                )
+                        else:
+                            prompt += (
+                                f"In addition, the waypoint selected by an expert is in color {selected_waypoint_color}. "
+                                f"If the waypoint you choose is the same as the expert, please analyze why it is correct. "
+                                f"If it is not the same, then please analyze why it is wrong and give the waypoint you choose. "
+                                f"If you cannot decide which waypoint to choose, please choose the waypoint selected by the expert. "
+                            )
+
+                            if current_instruction_id[i] == len(split_atomic_instructions[i]):
+                                prompt += (
+                                    f"Answer in format:"
+                                    f"Analysis: <analysis>, "
+                                    f"Current goal finished: <yes/no>, "
+                                    f"Waypoint color visible: [red, green, blue, yellow, purple], "
+                                    f"Waypoint chosen: <waypoint color/unneeded>, "
+                                )
+                            else:
+                                prompt += (
+                                    f"Answer in format:"
+                                    f"Analysis: <analysis>, "
+                                    f"Current goal finished: <yes/no>, "
+                                    f"Waypoint color visible: [red, green, blue, yellow, purple], "
+                                    f"Waypoint chosen: <waypoint color>, "
+                                )
+
+
+                        if stepk > 0:
+                            qwen_image_paths = [
+                                os.path.join(os.getcwd(), rgb_frame_history[i][stepk - 1]),
+                                os.path.join(os.getcwd(), output_file_name)]
+                        else:
+                            qwen_image_paths = [os.path.join(os.getcwd(), output_file_name)]
+                        mylogger.info(f"Query Qwen, image_paths: {qwen_image_paths}, Prompt: \n {prompt}")
+
+                        # result = query_qwen(qwen_image_paths, prompt)
+                        query_qwen_futures.append(query_qwen_pool.submit(query_qwen, qwen_image_paths, prompt))
+
+
+                        # self.envs.call_at(i, "remove_object")
+                    for i, gmap in enumerate(self.gmaps):
+                        new_ghost_nodes = llm_result[i]['new_ghost_nodes']
+                        selected_waypoint_color = llm_result[i]['selected_waypoint_color']
+
+                        result = query_qwen_futures[i].result()
+
+                        # parse the result
+                        try:
+                            analysis = result.split("Analysis: ")[1].split("Current goal finished:")[0]
+                            current_goal_finished = result.split("Current goal finished: ")[1].split(",")[0].split('\n')[
+                                0].lower().strip()
+                        except Exception as e:
+                            mylogger.error(f"error when split result: {result}")
+                            mylogger.error(traceback.format_exc())
+                            analysis = ''
+                            current_goal_finished = 'no'
+
+                        try:
+                            waypoint_visible = \
+                            result.split("Waypoint color visible: ")[1].split('\n')[0].strip().split("Waypoint chosen: ")[
+                                0].strip(', [].').split(',')
+                            waypoint_visible = [waypoint.strip() for waypoint in waypoint_visible]
+                        except:
+                            mylogger.error(
+                                f"error when split waypoint_visible: {result.split('Waypoint color visible: ')[1]}")
+                            waypoint_visible = []
+                            mylogger.error(traceback.format_exc())
+
+                        try:
+                            waypoint_chosen = \
+                            result.split("Waypoint chosen: ")[1].split(",")[0].split('\n')[0].lower().strip().split(' ')[0]
+                        except Exception as e:
+                            mylogger.error(f"error when split waypoint_chosen: {result.split('Waypoint chosen: ')[1]}")
+                            mylogger.error(traceback.format_exc())
+                            waypoint_chosen = 'unknown'
+
+                        mylogger.info(
+                            f"Analysis: {analysis}\n"
+                            f"Current goal finished: {current_goal_finished}\n"
+                            f"Waypoint put in scene: {BALL_COLORS[:len(new_ghost_nodes)]}\n"
+                            f"Waypoint color visible: {waypoint_visible}\n"
+                            f"Waypoint chosen: {waypoint_chosen}\n"
+                            f"Waypoint chosen valid: {waypoint_chosen in waypoint_visible}\n"
+                            f"Waypoint chosen same as expert: {waypoint_chosen == selected_waypoint_color}\n"
+                        )
+                        # print(f"Analysis: {analysis}")
+                        # print(f"Current goal finished: {current_goal_finished}")
+                        # print(f"Waypoint chosen: {waypoint_chosen}")
+                        # print(f"Waypoint chosen same as expert: {waypoint_chosen == selected_waypoint_color}")
+
+                        if current_goal_finished not in ['yes', 'no']:
+                            mylogger.error(f"current_goal_finished should be yes or no, but got {current_goal_finished}")
+                            current_goal_finished = 'no'
+
+                        if waypoint_chosen not in BALL_COLORS[:len(new_ghost_nodes)] and waypoint_chosen not in ['unknown',
+                                                                                                                 'unneeded']:
+                            mylogger.error(
+                                f"waypoint_chosen should be in {BALL_COLORS[:len(new_ghost_nodes)]}, but got {waypoint_chosen}")
+                            waypoint_chosen = 'unknown'
+                        elif waypoint_chosen not in waypoint_visible and waypoint_chosen not in ['unknown', 'unneeded']:
+                            mylogger.error(
+                                f"waypoint_chosen should be in waypoint_visible {waypoint_visible}, but got {waypoint_chosen}")
+                            waypoint_chosen = 'unknown'
+
+                        # assert current_goal_finished in ['yes', 'no'], f"current_goal_finished should be yes or no, but got {current_goal_finished}"
+                        # assert waypoint_chosen in BALL_COLORS[:len(new_ghost_nodes)] or waypoint_chosen in ['unknown', 'unneeded'], f"waypoint_chosen should be in {BALL_COLORS[:len(new_ghost_nodes)]}, but got {waypoint_chosen}"
+                        if current_goal_finished == 'yes':
+                            current_instruction_id[i] = current_instruction_id[i] + 1
+
+                        llm_result[i]['analysis'] = analysis
+                        llm_result[i]['current_goal_finished'] = current_goal_finished
+                        llm_result[i]['waypoint_chosen'] = waypoint_chosen
+                        llm_result[i][
+                            'etp_selected_waypoint_color'] = selected_waypoint_color if selected_waypoint_color in waypoint_visible else 'unknown'
+                        llm_result[i]['waypoint_chosen_same_as_expert'] = waypoint_chosen == selected_waypoint_color
+
+                # make equiv action
+                env_actions = []
+                use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING)
+                for i, gmap in enumerate(self.gmaps):
+                    if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]:
+                        # stop at node with max stop_prob
+                        vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
+                        stop_scores = [s[1] for s in vp_stop_scores]
+                        stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                        stop_pos = gmap.node_pos[stop_vp]
+                        if self.config.IL.back_algo == 'control':
+                            back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
+                            back_path = back_path[1:]
+                        else:
+                            back_path = None
+                        vis_info = {
+                            'nodes': list(gmap.node_pos.values()),
+                            'ghosts': list(gmap.ghost_aug_pos.values()),
+                            'predict_ghost': stop_pos,
+                            'stop_by': 'etpnav',
+                            'different_vp': different_vp[i],
+                            'insist_vp': insist_vp[i],
+                        }
+                        # print('action 0')
+
+                        if cpu_a_t[i] == 0 and current_instruction_id[i] < len(split_atomic_instructions[i]) - 1:
+                            pass
+                        else:
+                            env_actions.append(
+                                {
+                                    'action': {
+                                        'act': 0,
+                                        'cur_vp': cur_vp[i],
+                                        'stop_vp': stop_vp, 'stop_pos': stop_pos,
+                                        'back_path': back_path,
+                                        'tryout': use_tryout,
+                                    },
+                                    'vis_info': vis_info,
+                                }
+                            )
+
+                        mylogger.info(f"Stop by etpnav")
+                    else:
+                        ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                        vp_history[i][stepk] = ghost_vp
+                        ghost_pos = gmap.ghost_aug_pos[ghost_vp]
+                        _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
+                        front_pos = gmap.node_pos[front_vp]
+
+                        if self.config.VIDEO_OPTION:
+                            teacher_action_cpu = teacher_actions[i].cpu().item()
+                            if teacher_action_cpu in [0, -100]:
+                                teacher_ghost = None
+                            else:
+                                teacher_ghost = gmap.ghost_aug_pos[nav_inputs['gmap_vp_ids'][i][teacher_action_cpu]]
+                            vis_info = {
+                                'nodes': list(gmap.node_pos.values()),
+                                'ghosts': list(gmap.ghost_aug_pos.values()),
+                                'predict_ghost': ghost_pos,
+                                'teacher_ghost': teacher_ghost,
+                                'different_vp': different_vp[i],
+                                'insist_vp': insist_vp[i],
+                            }
+                        else:
+                            vis_info = None
+                        # teleport to front, then forward to ghost
+                        if self.config.IL.back_algo == 'control':
+                            back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][front_vp]]
+                            back_path = back_path[1:]
+                        else:
+                            back_path = None
+                        # print('action 4')
+                        env_actions.append(
+                            {
+                                'action': {
+                                    'act': 4,
+                                    'cur_vp': cur_vp[i],
+                                    'front_vp': front_vp, 'front_pos': front_pos,
+                                    'ghost_vp': ghost_vp, 'ghost_pos': ghost_pos,
+                                    'back_path': back_path,
+                                    'tryout': use_tryout,
+                                },
+                                'vis_info': vis_info,
+                            }
+                        )
+
+                        prev_vp[i] = front_vp
+                        if self.config.MODEL.consume_ghost:
+                            gmap.delete_ghost(ghost_vp)
+
+
+                    # assert self.envs.num_envs <= 1:
+                        # frame = self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info})
+                        # rgb_frame = self.envs.call_at(0, "get_rgb_frame", {"ghost_positions": list(gmap.new_ghost_pos.values())})
+                        # waypoint_nms = wp_outputs['waypoint_nms'][0].detach().cpu().numpy()
+                        #
+                        # np.save('tmp/waypoint_nms.npy', waypoint_nms)
+                        frame = self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info, "append_frame": False})
+                        frame = add_text_to_frame(frame, incremental_instructions[i][current_instruction_id[i] - 1])
+                        cv2.imwrite(f'tmp/{current_episode_name}/{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}-waypoint.png', frame)
+                        # cv2.imwrite('tmp/rgb.png', rgb_frame) # 'zsNo4HB9uLZ-417'
+
+                outputs = self.envs.step(env_actions)
+
+                for i in range(len(self.gmaps)):
+                    self.envs.call_at(i, "remove_object")
+
+                observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+
+            except Exception as e:
+                mylogger.error(traceback.format_exc())
+
+
+            # calculate metric
+            if mode == 'eval':
+                curr_eps = self.envs.current_episodes()
+                for i in range(self.envs.num_envs):
+                    if not dones[i]:
+                        continue
+                    info = infos[i]
+                    ep_id = curr_eps[i].episode_id
+                    gt_path = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float)
+                    pred_path = np.array(info['position']['position'])
+                    distances = np.array(info['position']['distance'])
+                    metric = {}
+                    metric['steps_taken'] = info['steps_taken']
+                    metric['distance_to_goal'] = distances[-1]
+                    metric['success'] = 1. if distances[-1] <= 3. else 0.
+                    metric['oracle_success'] = 1. if (distances <= 3.).any() else 0.
+                    metric['path_length'] = float(np.linalg.norm(pred_path[1:] - pred_path[:-1], axis=1).sum())
+                    metric['collisions'] = info['collisions']['count'] / len(pred_path)
+                    gt_length = distances[0]
+                    metric['spl'] = metric['success'] * gt_length / max(gt_length, metric['path_length'])
+                    dtw_distance = fastdtw(pred_path, gt_path, dist=NDTW.euclidean_distance)[0]
+                    metric['ndtw'] = np.exp(-dtw_distance / (len(gt_path) * 3.))
+                    metric['sdtw'] = metric['ndtw'] * metric['success']
+                    metric['ghost_cnt'] = self.gmaps[i].ghost_cnt
+                    self.stat_eps[ep_id] = metric
+                    self.pbar.update()
+
+            # record path
+            if mode == 'infer':
+                curr_eps = self.envs.current_episodes()
+                for i in range(self.envs.num_envs):
+                    if not dones[i]:
+                        continue
+                    info = infos[i]
+                    ep_id = curr_eps[i].episode_id
+                    self.path_eps[ep_id] = [
+                        {
+                            'position': info['position_infer']['position'][0],
+                            'heading': info['position_infer']['heading'][0],
+                            'stop': False
+                        }
+                    ]
+                    for p, h in zip(info['position_infer']['position'][1:], info['position_infer']['heading'][1:]):
+                        if p != self.path_eps[ep_id][-1]['position']:
+                            self.path_eps[ep_id].append({
+                                'position': p,
+                                'heading': h,
+                                'stop': False
+                            })
+                    self.path_eps[ep_id] = self.path_eps[ep_id][:500]
+                    self.path_eps[ep_id][-1]['stop'] = True
+                    self.pbar.update()
+
+            # pause env
+            if sum(dones) > 0:
+                for i in reversed(list(range(self.envs.num_envs))):
+                    if dones[i]:
+                        # from etpnav
+                        not_done_index.pop(i)
+                        self.envs.pause_at(i)
+                        observations.pop(i)
+                        # graph stop
+                        self.gmaps.pop(i)
+                        prev_vp.pop(i)
+
+                        # from customize
+                        rgb_frame_history.pop(i)
+                        current_instruction_id.pop(i)
+                        vp_history.pop(i)
+                        llm_result.pop(i)
+                        different_vp.pop(i)
+                        insist_vp.pop(i)
+                        dir_name.pop(i)
+                        instructions.pop(i)
+                        split_instructions.pop(i)
+                        split_atomic_instructions.pop(i)
+                        incremental_instructions.pop(i)
+                        incremental_instructions_token.pop(i)
+
+            if self.envs.num_envs == 0:
+                break
+
+            # obs for next step
+            observations = extract_instruction_tokens(observations,
+                                                      self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID)
+            for i in range(len(observations)):
+                observations[i]['instruction'] = incremental_instructions_token[i][current_instruction_id[i] - 1]
+
+            batch = batch_obs(observations, self.device)
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if mode == 'train':
+            loss = ml_weight * loss / total_actions
+            self.loss += loss
+            self.logs['IL_loss'].append(loss.item())
+
+
+
+    def customize_rollout_memory_between_episodes(self, mode, ml_weight=None, sample_ratio=None):
+        if mode == 'train':
+            feedback = 'sample'
+        elif mode == 'eval' or mode == 'infer':
+            feedback = 'argmax'
+        else:
+            raise NotImplementedError
+
+        self.envs.resume_all()
+        observations = self.envs.reset()
+        instr_max_len = self.config.IL.max_text_len  # r2r 80, rxr 200
+        instr_pad_id = 1 if self.config.MODEL.task_type == 'rxr' else 0
+        observations = extract_instruction_tokens(observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
+                                                  max_length=instr_max_len, pad_id=instr_pad_id)
+        batch = batch_obs(observations, self.device)
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if mode == 'eval':
+            env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
+                            if ep.episode_id in self.stat_eps]
+            self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
+            if self.envs.num_envs == 0: return
+        if mode == 'infer':
+            env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
+                            if ep.episode_id in self.path_eps]
+            self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
+            if self.envs.num_envs == 0: return
+            curr_eps = self.envs.current_episodes()
+            for i in range(self.envs.num_envs):
+                if self.config.MODEL.task_type == 'rxr':
+                    ep_id = curr_eps[i].episode_id
+                    k = curr_eps[i].instruction.instruction_id
+                    self.inst_ids[ep_id] = int(k)
+
+        current_episode_name = self.envs.call_at(0, "get_episode")['name']
+
+        # encode instructions
+        all_txt_ids = batch['instruction']
+        all_txt_masks = (all_txt_ids != instr_pad_id)
+        all_txt_embeds = self.policy.net(
+            mode='language',
+            txt_ids=all_txt_ids,
+            txt_masks=all_txt_masks,
+        )
+
+        loss = 0.
+        total_actions = 0.
+        not_done_index = list(range(self.envs.num_envs))
+
+        assert self.envs.num_envs == 1, "Customize rollout only supports single env for now."
+
+
+        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION)
+        ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
+        if os.path.basename(self.envs.current_episodes()[0].scene_id) not in self.graph_map_memory:
+            self.graph_map_memory[os.path.basename(self.envs.current_episodes()[0].scene_id)] = \
+                GraphMap(have_real_pos,
+                         self.config.IL.loc_noise,
+                         self.config.MODEL.merge_ghost,
+                         ghost_aug, merge_map=True)
+        self.gmaps = [self.graph_map_memory[os.path.basename(self.envs.current_episodes()[0].scene_id)]]
+
+        # self.gmaps = [GraphMap(have_real_pos,
+        #                        self.config.IL.loc_noise,
+        #                        self.config.MODEL.merge_ghost,
+        #                        ghost_aug, merge_map=False) for _ in range(self.envs.num_envs)]
+
+        for i, gmap in enumerate(self.gmaps):
+            gmap.reset_but_keep_node()
+        prev_vp = [None] * self.envs.num_envs
+
+        for stepk in range(self.max_len):
+            total_actions += self.envs.num_envs
+            txt_masks = all_txt_masks[not_done_index]
+            txt_embeds = all_txt_embeds[not_done_index]
+
+            # cand waypoint prediction
+            wp_outputs = self.policy.net(
+                mode="waypoint",
+                waypoint_predictor=self.waypoint_predictor,
+                observations=batch,
+                in_train=(mode == 'train' and self.config.IL.waypoint_aug),
+            )
+
+            # pano encoder
+            vp_inputs = self._vp_feature_variable(wp_outputs)
+            vp_inputs.update({
+                'mode': 'panorama',
+            })
+            pano_embeds, pano_masks = self.policy.net(**vp_inputs)
+            avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
+                              torch.sum(pano_masks, 1, keepdim=True)
+
+            # get vp_id, vp_pos of cur_node and cand_ndoe
+            cur_pos, cur_ori = self.get_pos_ori()
+            cur_vp, cand_vp, cand_pos = [], [], []
+            for i in range(self.envs.num_envs):
+                cur_vp_i, cand_vp_i, cand_pos_i = self.gmaps[i].identify_node(
+                    cur_pos[i], cur_ori[i], wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i]
+                )
+                cur_vp.append(cur_vp_i)
+                cand_vp.append(cand_vp_i)
+                cand_pos.append(cand_pos_i)
+
+            if mode == 'train' or self.config.VIDEO_OPTION:
+                cand_real_pos = []
+                for i in range(self.envs.num_envs):
+                    cand_real_pos_i = [
+                        self.envs.call_at(i, "get_cand_real_pos", {"angle": ang, "forward": dis})
+                        for ang, dis in zip(wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i])
+                    ]
+                    cand_real_pos.append(cand_real_pos_i)
+            else:
+                cand_real_pos = [None] * self.envs.num_envs
+
+            for i in range(self.envs.num_envs):
+                cur_embeds = avg_pano_embeds[i]
+                cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i] == 1]
+                self.gmaps[i].update_graph(prev_vp[i], stepk + 1,
+                                           cur_vp[i], cur_pos[i], cur_embeds,
+                                           cand_vp[i], cand_pos[i], cand_embeds,
+                                           cand_real_pos[i])
+
+            nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)
+            nav_inputs.update({
+                'mode': 'navigation',
+                'txt_embeds': txt_embeds,
+                'txt_masks': txt_masks,
+            })
+            no_vp_left = nav_inputs.pop('no_vp_left')
+            nav_outs = self.policy.net(**nav_inputs)
+            nav_logits = nav_outs['global_logits']
+            nav_probs = F.softmax(nav_logits, 1)
+            for i, gmap in enumerate(self.gmaps):
+                gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item()
+
+            # random sample demo
+            # logits = torch.randn(nav_inputs['gmap_masks'].shape).cuda()
+            # logits.masked_fill_(~nav_inputs['gmap_masks'], -float('inf'))
+            # logits.masked_fill_(nav_inputs['gmap_visited_masks'], -float('inf'))
+
+            if mode == 'train' or self.config.VIDEO_OPTION:
+                teacher_actions = self._teacher_action_new(nav_inputs['gmap_vp_ids'], no_vp_left)
+            if mode == 'train':
+                loss += F.cross_entropy(nav_logits, teacher_actions, reduction='sum', ignore_index=-100)
+
+            # determine action
+            if feedback == 'sample':
+                c = torch.distributions.Categorical(nav_probs)
+                a_t = c.sample().detach()
+                a_t = torch.where(torch.rand_like(a_t, dtype=torch.float) <= sample_ratio, teacher_actions, a_t)
+            elif feedback == 'argmax':
+                a_t = nav_logits.argmax(dim=-1)
+            else:
+                raise NotImplementedError
+            cpu_a_t = a_t.cpu().numpy()
+
             # make equiv action
             env_actions = []
             use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING)
@@ -1462,7 +2807,7 @@ class RLTrainer(BaseVLNCETrainer):
                     stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
                     stop_pos = gmap.node_pos[stop_vp]
                     if self.config.IL.back_algo == 'control':
-                        back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
+                        back_path = [(vp, gmap.node_pos[vp] if vp in gmap.node_pos else gmap.old_node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
                         back_path = back_path[1:]
                     else:
                         back_path = None
@@ -1471,7 +2816,6 @@ class RLTrainer(BaseVLNCETrainer):
                         'ghosts': list(gmap.ghost_aug_pos.values()),
                         'predict_ghost': stop_pos,
                     }
-                    print('action 0')
                     env_actions.append(
                         {
                             'action': {
@@ -1488,7 +2832,7 @@ class RLTrainer(BaseVLNCETrainer):
                     ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
                     ghost_pos = gmap.ghost_aug_pos[ghost_vp]
                     _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
-                    front_pos = gmap.node_pos[front_vp]
+                    front_pos = gmap.node_pos[front_vp] if front_vp in gmap.node_pos else gmap.old_node_pos[front_vp]
                     if self.config.VIDEO_OPTION:
                         teacher_action_cpu = teacher_actions[i].cpu().item()
                         if teacher_action_cpu in [0, -100]:
@@ -1505,11 +2849,10 @@ class RLTrainer(BaseVLNCETrainer):
                         vis_info = None
                     # teleport to front, then forward to ghost
                     if self.config.IL.back_algo == 'control':
-                        back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][front_vp]]
+                        back_path = [(vp, gmap.node_pos[vp] if vp in gmap.node_pos else gmap.old_node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][front_vp]]
                         back_path = back_path[1:]
                     else:
                         back_path = None
-                    # print('action 4')
                     env_actions.append(
                         {
                             'action': {
@@ -1527,14 +2870,12 @@ class RLTrainer(BaseVLNCETrainer):
                     if self.config.MODEL.consume_ghost:
                         gmap.delete_ghost(ghost_vp)
 
-            # tmp = self.envs.call_at(0, "get_info", {"observations": None})
-            # tmp = self.envs.call(['get_info'] * self.envs.num_envs, [None] * self.envs.num_envs)
-            # info = self.get_info(observations)
-            frame = self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info}) # 获取当前帧
-            cv2.imwrite('test.png', frame)
-
             outputs = self.envs.step(env_actions)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+
+            # cv2.imwrite(
+            #     f'tmp/{current_episode_name}/{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}-waypoint.png',
+            #     self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info, "append_frame": False}))
 
             # calculate metric
             if mode == 'eval':

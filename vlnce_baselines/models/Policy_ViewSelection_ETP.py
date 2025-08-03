@@ -197,7 +197,8 @@ class ETP(Net):
             obs_view12['rgb'] = rgb_batch
             depth_embedding = self.depth_encoder(obs_view12)  # torch.Size([bs, 128, 4, 4])
 
-            if waypoint_predictor.rgb_and_depth is True:
+            semantic_tensor = None
+            if waypoint_predictor.rgb_and_depth is True or waypoint_predictor.rgb_semantic_depth is True:
                 new_image_list = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                     futures = [executor.submit(process_image, tensor_image) for tensor_image in obs_view12['rgb']]
@@ -206,8 +207,10 @@ class ETP(Net):
 
                 merged_array = np.stack(new_image_list, axis=0)
                 device = obs_view12['rgb'].device
-                tensor_image_back = torch.from_numpy(merged_array).to(device)
-                obs_view12['rgb'] = tensor_image_back
+                semantic_tensor = torch.from_numpy(merged_array).to(device)
+
+                if waypoint_predictor.rgb_and_depth is True:
+                    obs_view12['rgb'] = semantic_tensor
 
             rgb_embedding = self.rgb_encoder(obs_view12)      # torch.Size([bs, 2048, 7, 7])
 
@@ -217,7 +220,7 @@ class ETP(Net):
 
             ''' waypoint prediction ----------------------------- '''
             waypoint_heatmap_logits = waypoint_predictor(
-                rgb_embedding, depth_embedding)
+                rgb_embedding, depth_embedding, semantic_tensor)
 
             # reverse the order of images back to counter-clockwise
             rgb_embed_reshape = rgb_embedding.reshape(
@@ -359,7 +362,9 @@ class ETP(Net):
                 'pano_rgb': pano_rgb,               # B x 12 x 2048
                 'pano_depth': pano_depth,           # B x 12 x 128
                 'pano_angle_fts': pano_angle_fts,   # 12 x 4
-                'pano_img_idxes': pano_img_idxes,   # 12 
+                'pano_img_idxes': pano_img_idxes,   # 12
+
+                'waypoint_nms': batch_output_map,
             }
             
             return outputs

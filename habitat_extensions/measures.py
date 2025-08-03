@@ -532,6 +532,12 @@ class TopDownMapVLNCE(Measure):
             self._top_down_map.shape[0:2],
             self._sim,
         )
+
+
+        if a_x >= self._top_down_map.shape[0]:
+            a_x = self._top_down_map.shape[0] - 1
+        if a_y >= self._top_down_map.shape[1]:
+            a_y = self._top_down_map.shape[1] - 1
         # Don't draw over the source point
         # gradient_color = 15 + min(
         #     self._step_count * 245 // self._config.MAX_EPISODE_STEPS, 245

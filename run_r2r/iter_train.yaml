@@ -60,6 +60,7 @@ MODEL:
   use_sprels: True
   merge_ghost: True
   consume_ghost: True
+#  consume_ghost: False
   
   spatial_output: False
   RGB_ENCODER:

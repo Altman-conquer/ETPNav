@@ -36,6 +36,8 @@ NODE = 19
 GHOST = 20
 PREDICT_GHOST = 21
 TEACHER_GHOST = 22
+DIFFERENT_VP = 23
+INSIST_VP = 24
 
 TOP_DOWN_MAP_COLORS = np.full((256, 3), 150, dtype=np.uint8)
 TOP_DOWN_MAP_COLORS[15:] = cv2.applyColorMap(
@@ -63,6 +65,8 @@ TOP_DOWN_MAP_COLORS[NODE] = [255, 165, 0]  # Orange
 TOP_DOWN_MAP_COLORS[GHOST] = [0, 0, 200]  # Blue
 TOP_DOWN_MAP_COLORS[PREDICT_GHOST] = [240, 240, 0]  # Yellow
 TOP_DOWN_MAP_COLORS[TEACHER_GHOST] = [240, 0, 0]  # Red
+TOP_DOWN_MAP_COLORS[DIFFERENT_VP] = [255, 0, 0]  # Red
+TOP_DOWN_MAP_COLORS[INSIST_VP] = [255, 0, 255]  # Purple
 
 
 def get_top_down_map(sim, map_resolution, meters_per_pixel):

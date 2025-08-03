@@ -1,5 +1,8 @@
+import copy
 import io
+import time
 
+import cv2
 import requests
 import torch
 import numpy as np
@@ -9,6 +12,13 @@ import json
 
 from PIL import Image
 
+BALL_COLORS = ['red', 'green', 'blue', 'yellow', 'purple']
+
+from transformers import AutoTokenizer, PretrainedConfig
+_instru_tokenizer = AutoTokenizer.from_pretrained(
+    '/home/zhandijia/.cache/huggingface/transformers/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/',
+    do_lower_case=True
+)
 
 def neighborhoods(mu, x_range, y_range, sigma, circular_x=True, gaussian=False):
     """ Generate masks centered at mu of the given x and y range with the
@@ -136,9 +146,81 @@ def process_image(tensor_image):
     numpy_image = tensor_image.cpu().detach().numpy()
 
     # Convert to PIL Image and save
-    image = Image.fromarray(numpy_image)
+    # image = Image.fromarray(numpy_image)
     # image.save('original_image.png')
 
     # Process the image
     new_image = send_image_for_inference(numpy_image)
     return new_image
+
+def query_qwen(image_paths, prompt):
+    base_url = 'http://127.0.0.1:5001'
+
+    qwen_payload = {
+        "image_paths": image_paths,
+        "prompt": prompt
+    }
+
+    qwen_response = requests.post(f"{base_url}/query_qwen", json=qwen_payload).json()
+
+    if qwen_response['status'] != 'success':
+        print(f"Error: {qwen_response}, retrying...")
+        time.sleep(0.5)
+        qwen_response = requests.post(f"{base_url}/query_qwen", json=qwen_payload).json()
+
+    print("query_qwen response:", qwen_response)
+    return qwen_response['result']
+
+def instruction_to_token(instruction: str):
+    def pad_instr_tokens(instr_tokens, maxlength=20):
+        if len(instr_tokens) <= 2:  # assert len(raw_instr_tokens) > 2
+            return None
+        if len(instr_tokens) > maxlength - 2:  # -2 for [CLS] and [SEP]
+            instr_tokens = instr_tokens[:(maxlength - 2)]
+        instr_tokens = ['[CLS]'] + instr_tokens + ['[SEP]']
+        instr_tokens += ['[PAD]'] * (maxlength - len(instr_tokens))
+        assert len(instr_tokens) == maxlength
+        return instr_tokens
+
+    instr_tokens = _instru_tokenizer.tokenize(instruction)
+    padded_instr_tokens = pad_instr_tokens(instr_tokens, 80)
+    instr_idxes = _instru_tokenizer.convert_tokens_to_ids(padded_instr_tokens)
+    # print(padded_instr_tokens)
+    # print(instr_idxes)
+
+    return instr_idxes
+
+
+
+def split_instruction(instruction: str):
+    base_url = 'http://127.0.0.1:5001'
+
+    kimi_payload = {
+        "instruction": instruction
+    }
+    kimi_response = requests.post(f"{base_url}/query_kimi", json=kimi_payload).json()
+    print("query_kimi response:", kimi_response)
+    return kimi_response['result']
+
+def add_text_to_frame(frame, text):
+    frame = copy.deepcopy(frame)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    font_color = (0, 0, 0)  # White color
+    thickness = 1
+    line_spacing = 10  # Spacing between lines
+
+    # Split text into multiple lines
+    lines = text.split('\n')
+    text_y = frame.shape[0] - 10 - (len(lines) - 1) * line_spacing  # Adjust starting position for multiple lines
+
+    for line in lines:
+        text_size = cv2.getTextSize(line, font, font_scale, thickness)[0]
+        text_x = (frame.shape[1] - text_size[0]) // 2  # Center the text horizontally
+        cv2.putText(frame, line, (text_x, text_y), font, font_scale, font_color, thickness)
+        text_y += line_spacing  # Move to the next line
+
+    return frame
+
+if __name__ == '__main__':
+    split_instruction('Walk forward down the hall past the table on the left. Continue going forward to you reach the open doorway to the left. Turn left and walk forward, stop in front of the doorway to the bathroom. Turn right and enter that hallway stop and wait in front of the sink on your right. ')

@@ -1,4 +1,6 @@
 from typing import Any, Dict, Optional, Tuple, List, Union
+
+import habitat_sim
 import math
 import random
 import habitat
@@ -9,10 +11,16 @@ from habitat.tasks.utils import cartesian_to_polar
 from habitat.utils.geometry_utils import quaternion_rotate_vector
 from habitat_baselines.common.baseline_registry import baseline_registry
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
-from habitat_extensions.utils import generate_video, heading_from_quaternion, navigator_video_frame, planner_video_frame
+
+from habitat_extensions.maps import drawpoint
+from habitat_extensions.utils import generate_video, heading_from_quaternion, navigator_video_frame, \
+    planner_video_frame, get_frame, UUIDS_EQ
 from scipy.spatial.transform import Rotation as R
 import cv2
 import os
+import magnum as mn
+
+from vlnce_baselines.waypoint_pred.utils import BALL_COLORS
 
 
 def quat_from_heading(heading, elevation=0):
@@ -427,15 +435,49 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         for vp, vp_pos in path:  # path[::-1]:
             self.single_step_control(vp_pos, tryout, vis_info)
 
-    def get_plan_frame(self, vis_info):
+    def get_plan_frame(self, vis_info, append_frame=True):
         agent_state = self._env.sim.get_agent_state()
         observations = self.get_observation_at(agent_state.position, agent_state.rotation)
         info = self.get_info(observations)
 
         frame = planner_video_frame(observations, info, vis_info)
         frame = cv2.copyMakeBorder(frame, 6, 6, 5, 5, cv2.BORDER_CONSTANT, value=(255, 255, 255))
-        self.plan_frames.append(frame)
+
+        if append_frame:
+            self.plan_frames.append(frame)
         return frame
+
+    def get_rgb_frame(self, ghost_positions: list = None, flat = False):
+        agent_state = self._env.sim.get_agent_state()
+        observations = self.get_observation_at(agent_state.position, agent_state.rotation)
+        rgb = get_frame(observations, flat=flat)
+        return rgb
+
+
+    def get_depth_frame(self, ghost_positions: list = None):
+        agent_state = self._env.sim.get_agent_state()
+        observations = self.get_observation_at(agent_state.position, agent_state.rotation)
+        depth = get_frame(observations, frame_type='depth')
+        return depth
+
+    def get_2d_point(self, sensor_name, point_3d):
+        sim = self._env.sim
+        # get the scene render camera and sensor object
+        visual_sensor = sim._sensors[sensor_name]
+        scene_graph = sim.get_active_scene_graph()
+        scene_graph.set_default_render_camera_parameters(visual_sensor._sensor_object)
+        render_camera = scene_graph.get_default_render_camera()
+
+        # use the camera and projection matrices to transform the point onto the near plane
+        projected_point_3d = render_camera.projection_matrix.transform_point(
+            render_camera.camera_matrix.transform_point(point_3d)
+        )
+        # convert the 3D near plane point to integer pixel space
+        point_2d = mn.Vector2(projected_point_3d[0], -projected_point_3d[1])
+        point_2d = point_2d / render_camera.projection_size()[0]
+        point_2d += mn.Vector2(0.5)
+        point_2d *= render_camera.viewport
+        return mn.Vector2i(point_2d)
 
     def step(self, action, vis_info, *args, **kwargs):
         act = action['act']
@@ -461,11 +503,18 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             if self.video_option:
                 self.get_plan_frame(vis_info)
 
-            # 1. back to stop node
-            if action['back_path'] is None:
-                self.teleport(action['stop_pos'])
+            if vis_info['stop_by'] == 'llm':
+                # 1. back to stop node
+                if action['back_path'] is None:
+                    self.teleport(action['stop_pos'])
+                else:
+                    self.multi_step_control(action['back_path'], action['tryout'], vis_info)
             else:
-                self.multi_step_control(action['back_path'], action['tryout'], vis_info)
+                # 1. back to stop node
+                if action['back_path'] is None:
+                    self.teleport(action['stop_pos'])
+                else:
+                    self.multi_step_control(action['back_path'], action['tryout'], vis_info)
 
             # 2. stop
             observations = self._env.step(act)
@@ -488,6 +537,14 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         info = self.get_info(observations)
 
         if self.video_option and done:
+            # for pano visualization
+            metrics = {
+                "sr": round(info["success"], 3),
+                # "spl": round(info["spl"], 3),
+                # "ndtw": round(info["ndtw"], 3),
+                # "sdtw": round(info["sdtw"], 3),
+            }
+
             # if 0 < info["spl"] <= 0.6:  #TODO backtrack
             generate_video(
                 video_option=self.video_option,
@@ -496,17 +553,11 @@ class VLNCEDaggerEnv(habitat.RLEnv):
                 episode_id=self._env.current_episode.episode_id,
                 scene_id=self._env.current_episode.scene_id.split('/')[-1].split('.')[-2],
                 checkpoint_idx=0,
-                metrics={"SPL": round(info["spl"], 3)},
+                metrics=metrics,
                 tb_writer=None,
                 fps=8,
             )
-            # for pano visualization
-            metrics = {
-                # "sr": round(info["success"], 3),
-                "spl": round(info["spl"], 3),
-                # "ndtw": round(info["ndtw"], 3),
-                # "sdtw": round(info["sdtw"], 3),
-            }
+
             metric_strs = []
             for k, v in metrics.items():
                 metric_strs.append(f"{k}{v:.2f}")
@@ -520,6 +571,97 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             self.plan_frames = []
 
         return observations, reward, done, info
+
+    def set_object_location_and_scale(self, sim, obj_id, location, scale):
+        r"""
+        Adds an object in front of the agent at some distance.
+        """
+        # agent_transform = sim.agents[0].scene_node.transformation_matrix()
+        # obj_translation = agent_transform.transform_point(
+        #     # np.array([0.25, 0.25, z_offset])
+        #     np.array([location[0], location[2], location[1]])
+        # )
+        # sim.set_translation(obj_translation, obj_id)
+        sim.set_translation(mn.Vector3(location), obj_id)
+
+        obj_node = sim.get_object_scene_node(obj_id)
+        xform_bb = habitat_sim.geo.get_transformed_bb(
+            obj_node.cumulative_bb, obj_node.transformation
+        )
+
+        # also account for collision margin of the scene
+        # scene_collision_margin = 0.04
+        # y_translation = mn.Vector3(
+        #     0, xform_bb.size_y() / 2.0 + scene_collision_margin, 0
+        # )
+        # sim.set_translation(y_translation + sim.get_translation(obj_id), obj_id)
+
+        # scale the object
+        scale_matrix = mn.Matrix4.scaling(mn.Vector3(scale))
+        obj_node.transformation = obj_node.transformation @ scale_matrix
+
+    def add_object(self, ghost_positions: dict):
+        sim = self._env.sim
+
+        # Manager of Object Attributes Templates
+        obj_attr_mgr = sim.get_object_template_manager()
+        obj_attr_mgr.load_configs(
+            str(os.path.join('data', "test_assets/objects"))
+        )
+
+        color_mapping = {}
+
+        for i, position_key in enumerate(ghost_positions.keys()):
+            position = ghost_positions[position_key]
+            color_mapping[BALL_COLORS[i]] = {
+                "vp_id": position_key,
+                "position": position,
+            }
+
+            obj_path = f"test_assets/objects/{BALL_COLORS[i]}_sphere"
+            chair_template_id = obj_attr_mgr.load_object_configs(
+                str(os.path.join('data', obj_path))
+            )[0]
+            chair_attr = obj_attr_mgr.get_template_by_ID(chair_template_id)
+            obj_attr_mgr.register_template(chair_attr)
+
+            current_position = sim.get_agent_state().position
+
+            # Object's initial position 3m away from the agent.
+            # object_id = sim.add_object_by_handle(chair_attr.handle)
+            # self.set_object_location_and_scale(sim, object_id, -1.0)
+            # sim.set_object_motion_type(
+            #     habitat_sim.physics.MotionType.STATIC, object_id
+            # )
+            relative_position = np.array(position) - current_position
+            position = np.array(position)
+            scale = float(np.linalg.norm(relative_position)) * 1.25
+
+            object_id = sim.add_object_by_handle(chair_attr.handle)
+            self.set_object_location_and_scale(sim, object_id, position, scale)
+            sim.set_object_motion_type(habitat_sim.physics.MotionType.STATIC, object_id)
+
+        return color_mapping
+
+    def remove_object(self):
+        sim = self._env.sim
+        for obj_id in sim.get_existing_object_ids():
+            sim.remove_object(obj_id)
+
+    def get_instruction(self):
+        # Get the instruction from the current episode
+        return self._env.current_episode.instruction
+
+    def get_episode(self):
+        episode_id = self._env.current_episode.episode_id
+        scene_id = self._env.current_episode.scene_id.split('/')[-1].split('.')[-2]
+        # tmp_name = f"{scene_id}-{episode_id}-" + "-".join(metric_strs)
+        # tmp_name = tmp_name.replace(" ", "_").replace("\n", "_") + ".png"
+        return {
+            'episode_id': episode_id,
+            'scene_id': scene_id,
+            'name': f"{scene_id}-{episode_id}",
+        }
 
 
 @baseline_registry.register_env(name="VLNCEInferenceEnv")

@@ -25,7 +25,9 @@ from habitat_baselines.common.baseline_registry import baseline_registry
 cv2 = try_cv2_import()
 obs_trans_to_eq = baseline_registry.get_obs_transformer("CubeMap2Equirect")
 UUIDS_EQ = ['rgbback', 'rgbdown', 'rgbfront', 'rgbright', 'rgbleft', 'rgbup']
+DEPTH_UUIDS_EQ = ['depthback', 'depthdown', 'depthfront', 'depthright', 'depthleft', 'depthup']
 CUBE2EQ = obs_trans_to_eq(UUIDS_EQ, (224,448))
+DEPTHCUBE2EQ = obs_trans_to_eq(DEPTH_UUIDS_EQ, (224,448))
 
 
 def observations_to_image(
@@ -578,6 +580,12 @@ def colorize_draw_agent_and_fit_to_height(
         #     maps.draw_waypoint(top_down_map, vis_info['teacher_ghost'][[0,2]], info["meters_per_px"], info["bounds"], maps.TEACHER_GHOST)
         if 'predict_ghost' in vis_info:
             maps.draw_waypoint(top_down_map, vis_info['predict_ghost'][[0,2]], info["meters_per_px"], info["bounds"], maps.PREDICT_GHOST)
+        if 'different_vp' in vis_info:
+            for p in vis_info['different_vp']:
+                maps.draw_waypoint(top_down_map, p[[0,2]], info["meters_per_px"], info["bounds"], maps.DIFFERENT_VP)
+        if 'insist_vp' in vis_info:
+            for p in vis_info['insist_vp']:
+                maps.draw_waypoint(top_down_map, p[[0,2]], info["meters_per_px"], info["bounds"], maps.INSIST_VP)
 
     top_down_map = maps.colorize_topdown_map(
         top_down_map, info["fog_of_war_mask"]
@@ -644,28 +652,31 @@ def append_text_to_image(image: np.ndarray, text: str):
     final = np.concatenate((image, text_image), axis=0)
     return final
 
-def get_rgb_frame(observations):
+def get_frame(observations, frame_type: str = 'rgb', masks: list = None, flat:bool = False):
+    if flat:
+        # concat rgbleft, rgbfront, rgbright to one image
+        rgb = np.concatenate(
+            [observations['rgbright'], observations['rgbfront'], observations['rgbleft']],
+            axis=1
+        )
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return rgb
+
     cube = {}
-    for uuid in UUIDS_EQ:
+    for uuid in UUIDS_EQ if frame_type == 'rgb' else DEPTH_UUIDS_EQ:
         cube[uuid] = deepcopy(observations[uuid])
+
+    # set back to black
+    if masks is not None:
+        for mask in masks:
+            cube[mask] = np.zeros_like(cube[mask])
 
     # cube = {uuid: observations.pop(uuid) for uuid in UUIDS_EQ}
     cube = {k: torch.from_numpy(v).unsqueeze(0) for k, v in cube.items()}
-    eq = CUBE2EQ(cube)
-    rgb = eq['rgbback'][0].numpy().copy()
+    eq = CUBE2EQ(cube) if frame_type == 'rgb' else DEPTHCUBE2EQ(cube)
+    rgb = eq['rgbback'][0].numpy().copy() if frame_type == 'rgb' else eq['depthback'][0].numpy().copy()
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     return rgb
-
-def get_rgb_covered_frame(
-    observations,
-    info,
-    vis_info=None,
-    map_k="top_down_map_vlnce",
-):
-    """
-    获取RGB+圆点waypoint画面
-    """
-    rgb_frame = get_rgb_frame(observations)
-
 
 def planner_video_frame(
     observations,

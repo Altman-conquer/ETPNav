@@ -20,23 +20,40 @@ class BinaryDistPredictor_TRM(nn.Module):
         self.HEATMAP_OFFSET = 5
 
         self.rgb_and_depth = False
+        self.rgb_semantic_depth = False
 
-        if self.rgb_and_depth:
+        if self.rgb_and_depth or self.rgb_semantic_depth:
             self.visual_fc_rgb = nn.Sequential(
                 nn.Flatten(),
                 # nn.Linear(np.prod([2048,7,7]), hidden_dim),
                 nn.Linear(np.prod([512]), hidden_dim),
                 nn.ReLU(True),
             )
+        if self.rgb_semantic_depth:
+            self.visual_fc_semantic = nn.Sequential(
+                nn.Flatten(),
+                # nn.Linear(np.prod([2048,7,7]), hidden_dim),
+                nn.Linear(np.prod([512]), hidden_dim),
+                nn.ReLU(True),
+            )
+
         self.visual_fc_depth = nn.Sequential(
             nn.Flatten(),
             nn.Linear(np.prod([128,4,4]), hidden_dim),
             nn.ReLU(True),
         )
-        self.visual_merge = nn.Sequential(
-            nn.Linear(hidden_dim*2, hidden_dim),
-            nn.ReLU(True),
-        )
+
+        if self.rgb_semantic_depth:
+            self.visual_merge = nn.Sequential(
+                nn.Linear(hidden_dim*3, hidden_dim),
+                nn.ReLU(True),
+            )
+        else:
+            self.visual_merge = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(True),
+            )
+
 
         config = BertConfig()
         config.model_type = 'visual'
@@ -47,7 +64,7 @@ class BinaryDistPredictor_TRM(nn.Module):
         config.num_hidden_layers = self.TRM_LAYER
         self.waypoint_TRM = WaypointBert(config=config)
 
-        if not self.rgb_and_depth:
+        if not self.rgb_and_depth and not self.rgb_semantic_depth:
             layer_norm_eps = config.layer_norm_eps
             self.mergefeats_LayerNorm = BertLayerNorm(
                 hidden_dim,
@@ -64,7 +81,7 @@ class BinaryDistPredictor_TRM(nn.Module):
                 int(n_classes*(self.num_angles/self.num_imgs))),
         )
 
-    def forward(self, rgb_feats, depth_feats):
+    def forward(self, rgb_feats, depth_feats, semantic_feats=None):
         bsi = rgb_feats.size(0) // self.num_imgs
 
         if self.rgb_and_depth:
@@ -74,6 +91,16 @@ class BinaryDistPredictor_TRM(nn.Module):
                 bsi, self.num_imgs, -1)
             vis_x = self.visual_merge(
                 torch.cat((rgb_x, depth_x), dim=-1)
+            )
+        elif self.rgb_semantic_depth:
+            rgb_x = self.visual_fc_rgb(rgb_feats).reshape(
+                bsi, self.num_imgs, -1)
+            semantic_x = self.visual_fc_semantic(semantic_feats).reshape(
+                bsi, self.num_imgs, -1)
+            depth_x = self.visual_fc_depth(depth_feats).reshape(
+                bsi, self.num_imgs, -1)
+            vis_x = self.visual_merge(
+                torch.cat((rgb_x, semantic_x, depth_x), dim=-1)
             )
         else:
             depth_x = self.visual_fc_depth(depth_feats).reshape(
