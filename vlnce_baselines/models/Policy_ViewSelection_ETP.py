@@ -196,9 +196,11 @@ class ETP(Net):
             obs_view12['depth'] = depth_batch
             obs_view12['rgb'] = rgb_batch
             depth_embedding = self.depth_encoder(obs_view12)  # torch.Size([bs, 128, 4, 4])
+            # waypoint_predictor.module.rgb_and_depth
 
             semantic_tensor = None
-            if waypoint_predictor.rgb_and_depth is True or waypoint_predictor.rgb_semantic_depth is True:
+            if (type(waypoint_predictor) == BinaryDistPredictor_TRM and (waypoint_predictor.rgb_and_depth is True or waypoint_predictor.rgb_semantic_depth is True)) or \
+                (waypoint_predictor.module.rgb_and_depth is True or waypoint_predictor.module.rgb_semantic_depth is True):
                 new_image_list = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                     futures = [executor.submit(process_image, tensor_image) for tensor_image in obs_view12['rgb']]

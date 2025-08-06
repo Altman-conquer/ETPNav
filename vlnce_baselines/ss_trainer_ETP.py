@@ -771,7 +771,7 @@ class RLTrainer(BaseVLNCETrainer):
         while len(self.stat_eps) < eps_to_eval:
         # while len(self.stat_eps) < 200:
         #     self.customize_rollout('eval')
-            self.customize_rollout_memory_between_episodes('eval')
+            self.customize_rollout_tod_down_map('eval')
         self.envs.close()
 
         if self.world_size > 1:
@@ -2873,6 +2873,325 @@ class RLTrainer(BaseVLNCETrainer):
             outputs = self.envs.step(env_actions)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
 
+            # cv2.imwrite(
+            #     f'tmp/{current_episode_name}/{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}-waypoint.png',
+            #     self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info, "append_frame": False}))
+
+            # calculate metric
+            if mode == 'eval':
+                curr_eps = self.envs.current_episodes()
+                for i in range(self.envs.num_envs):
+                    if not dones[i]:
+                        continue
+                    info = infos[i]
+                    ep_id = curr_eps[i].episode_id
+                    gt_path = np.array(self.gt_data[str(ep_id)]['locations']).astype(np.float)
+                    pred_path = np.array(info['position']['position'])
+                    distances = np.array(info['position']['distance'])
+                    metric = {}
+                    metric['steps_taken'] = info['steps_taken']
+                    metric['distance_to_goal'] = distances[-1]
+                    metric['success'] = 1. if distances[-1] <= 3. else 0.
+                    metric['oracle_success'] = 1. if (distances <= 3.).any() else 0.
+                    metric['path_length'] = float(np.linalg.norm(pred_path[1:] - pred_path[:-1], axis=1).sum())
+                    metric['collisions'] = info['collisions']['count'] / len(pred_path)
+                    gt_length = distances[0]
+                    metric['spl'] = metric['success'] * gt_length / max(gt_length, metric['path_length'])
+                    dtw_distance = fastdtw(pred_path, gt_path, dist=NDTW.euclidean_distance)[0]
+                    metric['ndtw'] = np.exp(-dtw_distance / (len(gt_path) * 3.))
+                    metric['sdtw'] = metric['ndtw'] * metric['success']
+                    metric['ghost_cnt'] = self.gmaps[i].ghost_cnt
+                    self.stat_eps[ep_id] = metric
+                    self.pbar.update()
+
+            # record path
+            if mode == 'infer':
+                curr_eps = self.envs.current_episodes()
+                for i in range(self.envs.num_envs):
+                    if not dones[i]:
+                        continue
+                    info = infos[i]
+                    ep_id = curr_eps[i].episode_id
+                    self.path_eps[ep_id] = [
+                        {
+                            'position': info['position_infer']['position'][0],
+                            'heading': info['position_infer']['heading'][0],
+                            'stop': False
+                        }
+                    ]
+                    for p, h in zip(info['position_infer']['position'][1:], info['position_infer']['heading'][1:]):
+                        if p != self.path_eps[ep_id][-1]['position']:
+                            self.path_eps[ep_id].append({
+                                'position': p,
+                                'heading': h,
+                                'stop': False
+                            })
+                    self.path_eps[ep_id] = self.path_eps[ep_id][:500]
+                    self.path_eps[ep_id][-1]['stop'] = True
+                    self.pbar.update()
+
+            # pause env
+            if sum(dones) > 0:
+                for i in reversed(list(range(self.envs.num_envs))):
+                    if dones[i]:
+                        not_done_index.pop(i)
+                        self.envs.pause_at(i)
+                        observations.pop(i)
+                        # graph stop
+                        self.gmaps.pop(i)
+                        prev_vp.pop(i)
+
+            if self.envs.num_envs == 0:
+                break
+
+            # obs for next step
+            observations = extract_instruction_tokens(observations,
+                                                      self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID)
+            batch = batch_obs(observations, self.device)
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if mode == 'train':
+            loss = ml_weight * loss / total_actions
+            self.loss += loss
+            self.logs['IL_loss'].append(loss.item())
+
+
+    def customize_rollout_tod_down_map(self, mode, ml_weight=None, sample_ratio=None):
+        if mode == 'train':
+            feedback = 'sample'
+        elif mode == 'eval' or mode == 'infer':
+            feedback = 'argmax'
+        else:
+            raise NotImplementedError
+
+        self.envs.resume_all()
+        observations = self.envs.reset()
+        instr_max_len = self.config.IL.max_text_len  # r2r 80, rxr 200
+        instr_pad_id = 1 if self.config.MODEL.task_type == 'rxr' else 0
+        observations = extract_instruction_tokens(observations, self.config.TASK_CONFIG.TASK.INSTRUCTION_SENSOR_UUID,
+                                                  max_length=instr_max_len, pad_id=instr_pad_id)
+        batch = batch_obs(observations, self.device)
+        batch = apply_obs_transforms_batch(batch, self.obs_transforms)
+
+        if mode == 'eval':
+            env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
+                            if ep.episode_id in self.stat_eps]
+            self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
+            if self.envs.num_envs == 0: return
+        if mode == 'infer':
+            env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
+                            if ep.episode_id in self.path_eps]
+            self.envs, batch = self._pause_envs(self.envs, batch, env_to_pause)
+            if self.envs.num_envs == 0: return
+            curr_eps = self.envs.current_episodes()
+            for i in range(self.envs.num_envs):
+                if self.config.MODEL.task_type == 'rxr':
+                    ep_id = curr_eps[i].episode_id
+                    k = curr_eps[i].instruction.instruction_id
+                    self.inst_ids[ep_id] = int(k)
+
+        current_episode_name = self.envs.call_at(0, "get_episode")['name']
+
+        # encode instructions
+        all_txt_ids = batch['instruction']
+        all_txt_masks = (all_txt_ids != instr_pad_id)
+        all_txt_embeds = self.policy.net(
+            mode='language',
+            txt_ids=all_txt_ids,
+            txt_masks=all_txt_masks,
+        )
+
+        loss = 0.
+        total_actions = 0.
+        not_done_index = list(range(self.envs.num_envs))
+
+        assert self.envs.num_envs == 1, "Customize rollout only supports single env for now."
+
+        have_real_pos = (mode == 'train' or self.config.VIDEO_OPTION)
+        ghost_aug = self.config.IL.ghost_aug if mode == 'train' else 0
+        if os.path.basename(self.envs.current_episodes()[0].scene_id) not in self.graph_map_memory:
+            self.graph_map_memory[os.path.basename(self.envs.current_episodes()[0].scene_id)] = \
+                GraphMap(have_real_pos,
+                         self.config.IL.loc_noise,
+                         self.config.MODEL.merge_ghost,
+                         ghost_aug, merge_map=True)
+        self.gmaps = [self.graph_map_memory[os.path.basename(self.envs.current_episodes()[0].scene_id)]]
+
+        # self.gmaps = [GraphMap(have_real_pos,
+        #                        self.config.IL.loc_noise,
+        #                        self.config.MODEL.merge_ghost,
+        #                        ghost_aug, merge_map=False) for _ in range(self.envs.num_envs)]
+
+        for i, gmap in enumerate(self.gmaps):
+            gmap.reset_but_keep_node()
+        prev_vp = [None] * self.envs.num_envs
+
+        for stepk in range(self.max_len):
+            total_actions += self.envs.num_envs
+            txt_masks = all_txt_masks[not_done_index]
+            txt_embeds = all_txt_embeds[not_done_index]
+
+            # cand waypoint prediction
+            wp_outputs = self.policy.net(
+                mode="waypoint",
+                waypoint_predictor=self.waypoint_predictor,
+                observations=batch,
+                in_train=(mode == 'train' and self.config.IL.waypoint_aug),
+            )
+
+            # pano encoder
+            vp_inputs = self._vp_feature_variable(wp_outputs)
+            vp_inputs.update({
+                'mode': 'panorama',
+            })
+            pano_embeds, pano_masks = self.policy.net(**vp_inputs)
+            avg_pano_embeds = torch.sum(pano_embeds * pano_masks.unsqueeze(2), 1) / \
+                              torch.sum(pano_masks, 1, keepdim=True)
+
+            # get vp_id, vp_pos of cur_node and cand_ndoe
+            cur_pos, cur_ori = self.get_pos_ori()
+            cur_vp, cand_vp, cand_pos = [], [], []
+            for i in range(self.envs.num_envs):
+                cur_vp_i, cand_vp_i, cand_pos_i = self.gmaps[i].identify_node(
+                    cur_pos[i], cur_ori[i], wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i]
+                )
+                cur_vp.append(cur_vp_i)
+                cand_vp.append(cand_vp_i)
+                cand_pos.append(cand_pos_i)
+
+            if mode == 'train' or self.config.VIDEO_OPTION:
+                cand_real_pos = []
+                for i in range(self.envs.num_envs):
+                    cand_real_pos_i = [
+                        self.envs.call_at(i, "get_cand_real_pos", {"angle": ang, "forward": dis})
+                        for ang, dis in zip(wp_outputs['cand_angles'][i], wp_outputs['cand_distances'][i])
+                    ]
+                    cand_real_pos.append(cand_real_pos_i)
+            else:
+                cand_real_pos = [None] * self.envs.num_envs
+
+            for i in range(self.envs.num_envs):
+                cur_embeds = avg_pano_embeds[i]
+                cand_embeds = pano_embeds[i][vp_inputs['nav_types'][i] == 1]
+                self.gmaps[i].update_graph(prev_vp[i], stepk + 1,
+                                           cur_vp[i], cur_pos[i], cur_embeds,
+                                           cand_vp[i], cand_pos[i], cand_embeds,
+                                           cand_real_pos[i])
+
+            nav_inputs = self._nav_gmap_variable(cur_vp, cur_pos, cur_ori)
+            nav_inputs.update({
+                'mode': 'navigation',
+                'txt_embeds': txt_embeds,
+                'txt_masks': txt_masks,
+            })
+            no_vp_left = nav_inputs.pop('no_vp_left')
+            nav_outs = self.policy.net(**nav_inputs)
+            nav_logits = nav_outs['global_logits']
+            nav_probs = F.softmax(nav_logits, 1)
+            for i, gmap in enumerate(self.gmaps):
+                gmap.node_stop_scores[cur_vp[i]] = nav_probs[i, 0].data.item()
+
+            # random sample demo
+            # logits = torch.randn(nav_inputs['gmap_masks'].shape).cuda()
+            # logits.masked_fill_(~nav_inputs['gmap_masks'], -float('inf'))
+            # logits.masked_fill_(nav_inputs['gmap_visited_masks'], -float('inf'))
+
+            if mode == 'train' or self.config.VIDEO_OPTION:
+                teacher_actions = self._teacher_action_new(nav_inputs['gmap_vp_ids'], no_vp_left)
+            if mode == 'train':
+                loss += F.cross_entropy(nav_logits, teacher_actions, reduction='sum', ignore_index=-100)
+
+            # determine action
+            if feedback == 'sample':
+                c = torch.distributions.Categorical(nav_probs)
+                a_t = c.sample().detach()
+                a_t = torch.where(torch.rand_like(a_t, dtype=torch.float) <= sample_ratio, teacher_actions, a_t)
+            elif feedback == 'argmax':
+                a_t = nav_logits.argmax(dim=-1)
+            else:
+                raise NotImplementedError
+            cpu_a_t = a_t.cpu().numpy()
+
+            # make equiv action
+            env_actions = []
+            use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING)
+            for i, gmap in enumerate(self.gmaps):
+                if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]:
+                    # stop at node with max stop_prob
+                    vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
+                    stop_scores = [s[1] for s in vp_stop_scores]
+                    stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                    stop_pos = gmap.node_pos[stop_vp]
+                    if self.config.IL.back_algo == 'control':
+                        back_path = [(vp, gmap.node_pos[vp] if vp in gmap.node_pos else gmap.old_node_pos[vp]) for vp in
+                                     gmap.shortest_path[cur_vp[i]][stop_vp]]
+                        back_path = back_path[1:]
+                    else:
+                        back_path = None
+                    vis_info = {
+                        'nodes': list(gmap.node_pos.values()),
+                        'ghosts': list(gmap.ghost_aug_pos.values()),
+                        'predict_ghost': stop_pos,
+                    }
+                    env_actions.append(
+                        {
+                            'action': {
+                                'act': 0,
+                                'cur_vp': cur_vp[i],
+                                'stop_vp': stop_vp, 'stop_pos': stop_pos,
+                                'back_path': back_path,
+                                'tryout': use_tryout,
+                            },
+                            'vis_info': vis_info,
+                        }
+                    )
+                else:
+                    ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                    ghost_pos = gmap.ghost_aug_pos[ghost_vp]
+                    _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
+                    front_pos = gmap.node_pos[front_vp] if front_vp in gmap.node_pos else gmap.old_node_pos[front_vp]
+                    if self.config.VIDEO_OPTION:
+                        teacher_action_cpu = teacher_actions[i].cpu().item()
+                        if teacher_action_cpu in [0, -100]:
+                            teacher_ghost = None
+                        else:
+                            teacher_ghost = gmap.ghost_aug_pos[nav_inputs['gmap_vp_ids'][i][teacher_action_cpu]]
+                        vis_info = {
+                            'nodes': list(gmap.node_pos.values()),
+                            'ghosts': list(gmap.ghost_aug_pos.values()),
+                            'predict_ghost': ghost_pos,
+                            'teacher_ghost': teacher_ghost,
+                        }
+                    else:
+                        vis_info = None
+                    # teleport to front, then forward to ghost
+                    if self.config.IL.back_algo == 'control':
+                        back_path = [(vp, gmap.node_pos[vp] if vp in gmap.node_pos else gmap.old_node_pos[vp]) for vp in
+                                     gmap.shortest_path[cur_vp[i]][front_vp]]
+                        back_path = back_path[1:]
+                    else:
+                        back_path = None
+                    env_actions.append(
+                        {
+                            'action': {
+                                'act': 4,
+                                'cur_vp': cur_vp[i],
+                                'front_vp': front_vp, 'front_pos': front_pos,
+                                'ghost_vp': ghost_vp, 'ghost_pos': ghost_pos,
+                                'back_path': back_path,
+                                'tryout': use_tryout,
+                            },
+                            'vis_info': vis_info,
+                        }
+                    )
+                    prev_vp[i] = front_vp
+                    if self.config.MODEL.consume_ghost:
+                        gmap.delete_ghost(ghost_vp)
+
+            outputs = self.envs.step(env_actions)
+            observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+
+            self.envs.call_at(0, "get_top_down_map")
             # cv2.imwrite(
             #     f'tmp/{current_episode_name}/{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}-waypoint.png',
             #     self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info, "append_frame": False}))

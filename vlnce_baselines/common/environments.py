@@ -1,3 +1,5 @@
+import shutil
+import time
 from typing import Any, Dict, Optional, Tuple, List, Union
 
 import habitat_sim
@@ -19,6 +21,7 @@ from scipy.spatial.transform import Rotation as R
 import cv2
 import os
 import magnum as mn
+import open3d as o3d
 
 from vlnce_baselines.waypoint_pred.utils import BALL_COLORS
 
@@ -460,6 +463,128 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         depth = get_frame(observations, frame_type='depth')
         return depth
 
+    def get_pose(self):
+        """
+            将位置和四元数转换为 4x4 变换矩阵，用于 Open3D 的 transform 函数。
+
+            参数:
+            - position: 摄像机位置坐标 (list 或 np.array)，如 [x, y, z]。
+            - quaternion: 四元数 (list 或 np.array)，如 [x, y, z, w]。
+
+            返回:
+            - transform: 4x4 变换矩阵 (np.array)。
+            """
+        position, quaternion = self.get_pos_ori()
+        # self._env.sim.get_agent_state().rotation
+
+        # 提取四元数
+        qx, qy, qz, qw = quaternion
+
+        # 计算旋转矩阵
+        rotation_matrix = np.array([
+            [1 - 2 * (qy ** 2 + qz ** 2), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx ** 2 + qz ** 2), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx ** 2 + qy ** 2)]
+        ])
+
+        # 构造 4x4 变换矩阵
+        transform = np.eye(4)
+        transform[:3, :3] = rotation_matrix
+        transform[:3, 3] = position
+
+        return transform
+
+    def get_top_down_map(self):
+        agent_state = self._env.sim.get_agent_state()
+        observations = self.get_observation_at(agent_state.position, agent_state.rotation)
+
+        os.makedirs("tmp/depth_images", exist_ok=True)
+        os.makedirs("tmp/rgb_images", exist_ok=True)
+        os.makedirs("tmp/poses", exist_ok=True)
+
+        # timestamp = time.time()
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+        UUIDS_EQ = ['rgbback', 'rgbdown', 'rgbfront', 'rgbright', 'rgbleft', 'rgbup']
+
+        for degree in range(0, 360, 30):
+            postfix = '' if degree == 0 else f'_{degree}'
+
+            depth = observations['depth' + postfix]
+            rgb = observations['rgb' + postfix]
+
+            rgb_pose = agent_state.sensor_states['rgb' + postfix]
+            depth_pose = agent_state.sensor_states['depth' + postfix]
+
+            import pickle
+
+            with open(f'tmp/rgb_images/{timestamp}.pkl', 'wb') as f:
+                pickle.dump(rgb, f)
+            with open(f'tmp/depth_images/{timestamp}.pkl', 'wb') as f:
+                pickle.dump(depth, f)
+            with open(f'tmp/poses/{timestamp}-rgb.pkl', 'wb') as f:
+                pickle.dump(rgb_pose, f)
+            with open(f'tmp/poses/{timestamp}-depth.pkl', 'wb') as f:
+                pickle.dump(depth_pose, f)
+
+        # W = H = depth.shape[0]
+        # hfov = 90
+        # K = np.array([
+        #     [1 / np.tan(hfov / 2.), 0., 0., 0.],
+        #     [0., 1 / np.tan(hfov / 2.), 0., 0.],
+        #     [0., 0., 1, 0],
+        #     [0., 0., 0, 1]])
+        # min_z = 0.8  # 地板以上
+        # max_z = 2.5  # 天花板以下
+        #
+        # xs, ys = np.meshgrid(np.linspace(-1, 1, W), np.linspace(1, -1, W))
+        # xs = xs.reshape(1, W, W)
+        # ys = ys.reshape(1, W, W)
+        #
+        # xys = np.vstack((xs * depth, ys * depth, -depth, np.ones(depth.shape)))
+        # xys = xys.reshape(4, -1)
+        # xy_c0 = np.matmul(np.linalg.inv(K), xys)
+        #
+        # quaternion_0 = agent_state.rotation
+        # translation_0 = agent_state.position
+        # rotation_0 = quaternion.as_rotation_matrix(quaternion_0)
+        # T_world_camera0 = np.eye(4)
+        # T_world_camera0[0:3, 0:3] = rotation_0
+        # T_world_camera0[0:3, 3] = translation_0
+        #
+        # world_coordinates = np.matmul(T_world_camera0, xy_c0)  # shape: (4, N)
+        # points = world_coordinates[:3, :].T  # (N, 3)
+        # zs = world_coordinates[2, :]  # (N,)
+        #
+        # # 过滤地板和天花板
+        # mask = (zs > min_z) & (zs < max_z)
+        # filtered_points = points[mask]
+        #
+        # # 计算颜色
+        # xs_img = ((xs.flatten() + 1) * (W - 1) / 2).astype(np.int32)
+        # ys_img = ((1 - ys.flatten()) * (W - 1) / 2).astype(np.int32)
+        # xs_img = xs_img[mask]
+        # ys_img = ys_img[mask]
+        # color = rgb[ys_img, xs_img] / 255.0  # 归一化到[0,1]
+        #
+        # # 用open3d保存带颜色点云
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(filtered_points)
+        # pcd.colors = o3d.utility.Vector3dVector(color)
+        # pcd = pcd.voxel_down_sample(voxel_size=0.05)
+        #
+        # if os.path.exists("tmp/depth_images"):
+        #     shutil.rmtree("tmp/depth_images")
+        # if os.path.exists("tmp/rgb_images"):
+        #     shutil.rmtree("tmp/rgb_images")
+
+        # timestamp = time.time()
+        # cv2.imwrite(f"tmp/rgb_images/{timestamp}.png", rgb_image)
+        # cv2.imwrite(f"tmp/depth_images/{timestamp}.png", depth_image * 255)
+        # cv2.imwrite("tmp/top_down_map_rgb.png", top_down_map)
+
+        # return top_down_map
+
     def get_2d_point(self, sensor_name, point_3d):
         sim = self._env.sim
         # get the scene render camera and sensor object
@@ -503,7 +628,7 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             if self.video_option:
                 self.get_plan_frame(vis_info)
 
-            if vis_info['stop_by'] == 'llm':
+            if vis_info.get('stop_by') == 'llm':
                 # 1. back to stop node
                 if action['back_path'] is None:
                     self.teleport(action['stop_pos'])

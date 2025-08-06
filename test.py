@@ -26,6 +26,7 @@
 import gzip
 import json
 import os
+import shutil
 import sys
 from typing import Any, Dict, List, Optional, Type
 
@@ -35,6 +36,7 @@ import git
 import magnum
 import magnum as mn
 import numpy as np
+import quaternion
 
 from matplotlib import pyplot as plt
 from PIL import Image
@@ -333,13 +335,262 @@ def init_objects(sim):
 
     # return object_id, goal_id
 
+def get_2d_point(sim, sensor_name, point_3d):
+    # get the scene render camera and sensor object
+    visual_sensor = sim._sensors[sensor_name]
+    scene_graph = sim.get_active_scene_graph()
+    scene_graph.set_default_render_camera_parameters(visual_sensor._sensor_object)
+    render_camera = scene_graph.get_default_render_camera()
+
+    # use the camera and projection matrices to transform the point onto the near plane
+    projected_point_3d = render_camera.projection_matrix.transform_point(
+        render_camera.camera_matrix.transform_point(point_3d)
+    )
+    # convert the 3D near plane point to integer pixel space
+    point_2d = mn.Vector2(projected_point_3d[0], -projected_point_3d[1])
+    point_2d = point_2d / render_camera.projection_size()[0]
+    point_2d += mn.Vector2(0.5)
+    point_2d *= render_camera.viewport
+    return mn.Vector2i(point_2d)
+
+def test(sim, rgbs=None, depths=None, cameras=None):
+    import os
+    import shutil
+    import open3d as o3d
+    import numpy as np
+    import cv2
+    import quaternion
+
+    if rgbs is None or depths is None or cameras is None:
+        depths = []
+        rgbs = []
+        cameras = [sim.agents[0].state]
+        depth = sim.get_sensor_observations()['depth']
+        rgb = sim.get_sensor_observations()['rgb']
+        depths.append(depth)
+        rgbs.append(rgb)
+
+    W = H = 256
+    hfov = 90
+    K = np.array([
+        [1 / np.tan(hfov / 2.), 0., 0., 0.],
+        [0., 1 / np.tan(hfov / 2.), 0., 0.],
+        [0., 0., 1, 0],
+        [0., 0., 0, 1]])
+
+    filter_using_height = False
+    min_z = 0.8  # 地板以上
+    max_z = 2.5  # 天花板以下
+
+    all_points = []
+    all_colors = []
+
+    for i in range(len(rgbs)):
+        depth = depths[i].reshape(1, W, W)
+        rgb = rgbs[i][:, :, :3]  # 取RGB通道
+        if rgb.shape[:2] != depth.shape[1:]:
+            rgb = cv2.resize(rgb, (depth.shape[2], depth.shape[1]), interpolation=cv2.INTER_AREA)
+
+        xs, ys = np.meshgrid(np.linspace(-1, 1, W), np.linspace(1, -1, W))
+        xs = xs.reshape(1, W, W)
+        ys = ys.reshape(1, W, W)
+
+        xys = np.vstack((xs * depth, ys * depth, -depth, np.ones(depth.shape)))
+        xys = xys.reshape(4, -1)
+        xy_c0 = np.matmul(np.linalg.inv(K), xys)
+
+        quaternion_0 = cameras[i].rotation
+        translation_0 = cameras[i].position
+        rotation_0 = quaternion.as_rotation_matrix(quaternion_0)
+        T_world_camera0 = np.eye(4)
+        T_world_camera0[0:3, 0:3] = rotation_0
+        T_world_camera0[0:3, 3] = translation_0
+
+        world_coordinates = np.matmul(T_world_camera0, xy_c0)  # shape: (4, N)
+        points = world_coordinates[:3, :].T  # (N, 3)
+        zs = world_coordinates[2, :]  # (N,)
+
+        # 过滤地板和天花板
+        if filter_using_height:
+            mask = (zs > min_z) & (zs < max_z)
+        else:
+            mask = np.ones_like(zs, dtype=bool)
+        filtered_points = points[mask]
+
+        # 计算颜色
+        xs_img = ((xs.flatten() + 1) * (W - 1) / 2).astype(np.int32)
+        ys_img = ((1 - ys.flatten()) * (W - 1) / 2).astype(np.int32)
+        xs_img = xs_img[mask]
+        ys_img = ys_img[mask]
+        color = rgb[ys_img, xs_img] / 255.0  # 归一化到[0,1]
+        all_points.append(filtered_points)
+        all_colors.append(color)
+
+    merged_points = np.concatenate(all_points, axis=0)
+    merged_colors = np.concatenate(all_colors, axis=0)
+
+    # 假设 merged_points 是 (N, 3) 的点云数组
+    z_values = merged_points[:, 2]  # 所有点的高度
+
+    # 设置高度区间，比如每 0.1 米一个区间
+    bins = np.arange(z_values.min(), z_values.max() + 0.1, 0.1)
+    hist, bin_edges = np.histogram(z_values, bins=bins)
+
+    # 输出每个高度区间的点数
+    for i in range(len(hist)):
+        print(f"高度区间 {bin_edges[i]:.2f} ~ {bin_edges[i + 1]:.2f} 米: 点数 {hist[i]}")
+
+    # 用open3d保存带颜色点云
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(merged_points)
+    pcd.colors = o3d.utility.Vector3dVector(merged_colors)
+    pcd = pcd.voxel_down_sample(voxel_size=0.05)
+
+    os.makedirs("tmp", exist_ok=True)
+    output_file = "tmp/point_cloud_merged.ply"
+    o3d.io.write_point_cloud(output_file, pcd)
+
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import numpy as np
+
+    # 假设 points 是 (N, 3) 的点云数组
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors, s=1)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    plt.show()
+
+    # 保存深度和RGB图像
+    if os.path.exists("tmp/depth_images"):
+        shutil.rmtree("tmp/depth_images")
+    if os.path.exists("tmp/rgb_images"):
+        shutil.rmtree("tmp/rgb_images")
+    os.makedirs("tmp/depth_images", exist_ok=True)
+    os.makedirs("tmp/rgb_images", exist_ok=True)
+    for idx, depth in enumerate(depths):
+        depth_image = (depth * 255 / np.max(depth)).astype(np.uint8)
+        cv2.imwrite(f"tmp/depth_images/depth_{idx:03d}.png", depth_image)
+    for idx, rgb in enumerate(rgbs):
+        rgb_image = cv2.cvtColor(rgb, cv2.COLOR_RGBA2RGB)
+        cv2.imwrite(f"tmp/rgb_images/rgb_{idx:03d}.png", rgb_image)
+
+    return pcd
+
+def down_project_pcd_to_2d(pcd, plane='xy', grid_size=0.05):
+    import numpy as np
+    import cv2
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+    if plane == 'xy':
+        x, y = points[:, 0], points[:, 1]
+    elif plane == 'xz':
+        x, y = points[:, 0], points[:, 2]
+    elif plane == 'yz':
+        x, y = points[:, 1], points[:, 2]
+    else:
+        raise ValueError("plane must be 'xy', 'xz', or 'yz'")
+
+    # 归一化到正区间
+    x_min, y_min = x.min(), y.min()
+    x = x - x_min
+    y = y - y_min
+
+    # 网格尺寸
+    x_max, y_max = x.max(), y.max()
+    img_w = int(np.ceil(x_max / grid_size)) + 1
+    img_h = int(np.ceil(y_max / grid_size)) + 1
+
+    img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+    count = np.zeros((img_h, img_w), dtype=np.int32)
+    color_sum = np.zeros((img_h, img_w, 3), dtype=np.float32)
+
+    # 投影点云到2D网格，累加颜色
+    for i in range(points.shape[0]):
+        xi = int(x[i] / grid_size)
+        yi = int(y[i] / grid_size)
+        color_sum[yi, xi] += colors[i]
+        count[yi, xi] += 1
+
+    # 计算平均颜色
+    mask = count > 0
+    img[mask] = (color_sum[mask] / count[mask, None] * 255).astype(np.uint8)
+
+    cv2.imwrite('tmp/down_projected_2d.png', img)
+    return img
+
+def rotate_and_capture(sim, steps=36):
+    """
+    让代理旋转360度，并捕获所有看到的RGB和深度图像。
+
+    参数:
+    - sim: Habitat模拟器实例。
+    - steps: 将360度分成的步数（每步旋转角度为360/steps）。
+
+    返回:
+    - rgb_images: 包含所有RGB图像的列表。
+    - depth_images: 包含所有深度图像的列表。
+    """
+    rgb_images = []
+    depth_images = []
+    cameras = []
+
+    # 每步旋转的角度
+    angle_per_step = 360 / steps
+
+    for _ in range(steps):
+        # 获取当前传感器的观测
+        observations = sim.get_sensor_observations()
+        rgb_images.append(observations["rgb"])
+        depth_images.append(observations["depth"])
+        cameras.append(sim.agents[0].state)
+
+        # 让代理旋转
+        sim.agents[0].act("turn_right")
+
+    return rgb_images, depth_images, cameras
+
+def load_from_npy_folder(rgb_dir, depth_dir, pose_dir):
+    import numpy as np
+    import os
+    import pickle
+
+    rgbs, depths, cameras = [], [], []
+    rgb_files = sorted(os.listdir(rgb_dir))
+    for file in rgb_files:
+        timestamp = file.replace('.pkl', '')
+        with open(os.path.join(rgb_dir, f"{timestamp}.pkl"), "rb") as f:
+            rgb = pickle.load(f)
+        with open(os.path.join(depth_dir, f"{timestamp}.pkl"), "rb") as f:
+            depth = pickle.load(f)
+        with open(os.path.join(pose_dir, f"{timestamp}.pkl"), "rb") as f:
+            pose = pickle.load(f)
+        rgbs.append(rgb)
+        depths.append(depth)
+        cameras.append(pose)
+    return rgbs, depths, cameras
+
+# pcd = test(sim, rgbs, depths, cameras)
+# down_project_pcd_to_2d(pcd, 'yz')
 
 with habitat_sim.Simulator(cfg) as sim:
+    # get_2d_point(sim, 'rgb', mn.Vector3(0, 0, 0.5))
     init_agent(sim)
     init_objects(sim)
+
+    rgbs, depths, cameras = rotate_and_capture(sim, steps=3)
+    # rgbs, depths, cameras = load_from_npy_folder("tmp/rgb_images", "tmp/depth_images", "tmp/poses")
+
+    pcd = test(sim, rgbs, depths, cameras)
+    down_project_pcd_to_2d(pcd, 'yz')
 
     # Visualize the scene after the chair is added into the scene.
     if make_video:
         simulate_and_make_vid(
-            sim, None, "object-init", dt=1.0, open_vid=show_video
+            sim, None, "object-init", dt=1.0, open_vid=False
         )
