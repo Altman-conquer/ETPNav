@@ -17,4 +17,6 @@ __pycache__/
 /interact
 /pretrain_src/datasets
 /pretrain_src/img_features
+tmp/
+examples/
 hft.db
