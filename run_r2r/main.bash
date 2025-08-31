@@ -1,13 +1,14 @@
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
 
-flag1="--exp_name release_r2r
+flag1="--local_rank=0
+      --exp_name release_r2r
       --run-type train
       --exp-config run_r2r/iter_train.yaml
-      SIMULATOR_GPU_IDS [0,1]
-      TORCH_GPU_IDS [0,1]
-      GPU_NUMBERS 2
-      NUM_ENVIRONMENTS 8
+      SIMULATOR_GPU_IDS [0]
+      TORCH_GPU_IDS [0]
+      GPU_NUMBERS 1
+      NUM_ENVIRONMENTS 1
       IL.iters 15000
       IL.lr 1e-5
       IL.log_every 200

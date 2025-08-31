@@ -200,7 +200,7 @@ class ETP(Net):
 
             semantic_tensor = None
             if (type(waypoint_predictor) == BinaryDistPredictor_TRM and (waypoint_predictor.rgb_and_depth is True or waypoint_predictor.rgb_semantic_depth is True)) or \
-                (waypoint_predictor.module.rgb_and_depth is True or waypoint_predictor.module.rgb_semantic_depth is True):
+                (type(waypoint_predictor) != BinaryDistPredictor_TRM and (waypoint_predictor.module.rgb_and_depth is True or waypoint_predictor.module.rgb_semantic_depth is True)):
                 new_image_list = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                     futures = [executor.submit(process_image, tensor_image) for tensor_image in obs_view12['rgb']]

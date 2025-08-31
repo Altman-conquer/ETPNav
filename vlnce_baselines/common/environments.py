@@ -319,6 +319,12 @@ class VLNCEDaggerEnv(habitat.RLEnv):
 
     def reset(self):
         observations = self._env.reset()
+
+        # 将 observations 中的 uint32 类型转换为 int32
+        for k, v in observations.items():
+            if isinstance(v, np.ndarray) and v.dtype == np.uint32:
+                observations[k] = v.astype(np.int32)
+
         if self.video_option:
             info = self.get_info(observations)
             self.video_frames = [
@@ -495,37 +501,73 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         return transform
 
     def get_top_down_map(self):
+        def get_agent_pose(state):
+            agent_pos = state.position
+            agent_rot = state.rotation
+            heading_vector = quaternion_rotate_vector(
+                agent_rot.inverse(), np.array([0, 0, -1]))
+            phi = cartesian_to_polar(
+                -heading_vector[2], heading_vector[0])[1]
+            angle = phi
+            print(f'agent position = {agent_pos}, angle = {angle}')
+            pose = (agent_pos[0], agent_pos[2], angle)
+            return pose
+
         agent_state = self._env.sim.get_agent_state()
         observations = self.get_observation_at(agent_state.position, agent_state.rotation)
 
         os.makedirs("tmp/depth_images", exist_ok=True)
         os.makedirs("tmp/rgb_images", exist_ok=True)
+        os.makedirs("tmp/semantic_images", exist_ok=True)
+        os.makedirs("tmp/depth_images_png", exist_ok=True)
+        os.makedirs("tmp/rgb_images_png", exist_ok=True)
         os.makedirs("tmp/poses", exist_ok=True)
+        os.makedirs("tmp/rgb_poses", exist_ok=True)
+        os.makedirs("tmp/depth_poses", exist_ok=True)
 
         # timestamp = time.time()
         timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
-        UUIDS_EQ = ['rgbback', 'rgbdown', 'rgbfront', 'rgbright', 'rgbleft', 'rgbup']
+        # DIRS = ['back', 'down', 'front', 'right', 'left', 'up']
+
+        # for degree in DIRS:
+        #     postfix = '' if degree == 0 else f'{degree}'
+        #
+        #     depth = observations['mydept' + postfix]
+        #     rgb = observations['myrg' + postfix]
+        #
+        #     rgb_pose = get_agent_pose(agent_state.sensor_states['myrg' + postfix])
+        #     depth_pose = get_agent_pose(agent_state.sensor_states['mydept' + postfix])
 
         for degree in range(0, 360, 30):
             postfix = '' if degree == 0 else f'_{degree}'
 
             depth = observations['depth' + postfix]
             rgb = observations['rgb' + postfix]
+            semantic = observations[f'mysemanti_{degree}']
 
-            rgb_pose = agent_state.sensor_states['rgb' + postfix]
-            depth_pose = agent_state.sensor_states['depth' + postfix]
+            rgb_pose = get_agent_pose(agent_state.sensor_states['rgb' + postfix])
+            depth_pose = get_agent_pose(agent_state.sensor_states['depth' + postfix])
 
             import pickle
 
-            with open(f'tmp/rgb_images/{timestamp}.pkl', 'wb') as f:
+            with open(f'tmp/rgb_images/{timestamp}{postfix}.pkl', 'wb') as f:
                 pickle.dump(rgb, f)
-            with open(f'tmp/depth_images/{timestamp}.pkl', 'wb') as f:
+            with open(f'tmp/depth_images/{timestamp}{postfix}.pkl', 'wb') as f:
                 pickle.dump(depth, f)
-            with open(f'tmp/poses/{timestamp}-rgb.pkl', 'wb') as f:
+            with open(f'tmp/semantic_images/{timestamp}{postfix}.pkl', 'wb') as f:
+                pickle.dump(semantic, f)
+            with open(f'tmp/rgb_poses/{timestamp}{postfix}.pkl', 'wb') as f:
                 pickle.dump(rgb_pose, f)
-            with open(f'tmp/poses/{timestamp}-depth.pkl', 'wb') as f:
+            with open(f'tmp/depth_poses/{timestamp}{postfix}.pkl', 'wb') as f:
                 pickle.dump(depth_pose, f)
+            with open(f'tmp/poses/{timestamp}{postfix}.pkl', 'wb') as f:
+                pickle.dump(depth_pose, f)
+
+            # 保存为png图片
+            cv2.imwrite(f'tmp/rgb_images_png/{timestamp}{postfix}.png', rgb[..., ::-1])  # BGR
+            depth_norm = (depth / np.max(depth) * 255).astype(np.uint8) if np.max(depth) > 0 else depth.astype(np.uint8)
+            cv2.imwrite(f'tmp/depth_images_png/{timestamp}{postfix}.png', depth_norm)
 
         # W = H = depth.shape[0]
         # hfov = 90
@@ -624,6 +666,13 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             agent_state = self._env.sim.get_agent_state()
             observations = self.get_observation_at(agent_state.position, agent_state.rotation)
 
+
+            # 将 observations 中的 uint32 类型转换为 int32
+            for k, v in observations.items():
+                if isinstance(v, np.ndarray) and v.dtype == np.uint32:
+                    observations[k] = v.astype(np.int32)
+
+
         elif act == 0:  # stop
             if self.video_option:
                 self.get_plan_frame(vis_info)
@@ -643,6 +692,12 @@ class VLNCEDaggerEnv(habitat.RLEnv):
 
             # 2. stop
             observations = self._env.step(act)
+
+            # 将 observations 中的 uint32 类型转换为 int32
+            for k, v in observations.items():
+                if isinstance(v, np.ndarray) and v.dtype == np.uint32:
+                    observations[k] = v.astype(np.int32)
+
             if self.video_option:
                 info = self.get_info(observations)
                 self.video_frames.append(

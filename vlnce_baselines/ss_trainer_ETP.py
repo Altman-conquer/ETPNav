@@ -728,6 +728,50 @@ class RLTrainer(BaseVLNCETrainer):
                     sensor_uuids.append(camera_config.UUID)
                     setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
                     self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
+
+            MY_H = 256
+
+            # sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"RGB_SENSOR")
+            # for camera_id, orient in orient_dict.items():
+            #     camera_template = f"MYRG{camera_id}"
+            #     camera_config = deepcopy(sensor)
+            #     camera_config.WIDTH = MY_H
+            #     camera_config.HEIGHT = MY_H
+            #     camera_config.ORIENTATION = orient
+            #     camera_config.UUID = camera_template.lower()
+            #     camera_config.HFOV = 90
+            #     sensor_uuids.append(camera_config.UUID)
+            #     setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
+            #     self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
+            #
+            # sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"DEPTH_SENSOR")
+            # for camera_id, orient in orient_dict.items():
+            #     camera_template = f"MYDEPT{camera_id}"
+            #     camera_config = deepcopy(sensor)
+            #     camera_config.WIDTH = MY_H
+            #     camera_config.HEIGHT = MY_H
+            #     camera_config.ORIENTATION = orient
+            #     camera_config.UUID = camera_template.lower()
+            #     camera_config.HFOV = 90
+            #     sensor_uuids.append(camera_config.UUID)
+            #     setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
+            #     self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
+
+            camera_orientations = get_camera_orientations12()
+            camera_orientations['0'] = [0.0, 0.0, 0.0]
+
+            sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"SEMANTIC_SENSOR")
+            for camera_id, orient in camera_orientations.items():
+                camera_template = f"MYSEMANTI_{camera_id}"
+                camera_config = deepcopy(sensor)
+                camera_config.WIDTH = MY_H
+                camera_config.HEIGHT = MY_H
+                camera_config.ORIENTATION = orient
+                camera_config.UUID = camera_template.lower()
+                camera_config.HFOV = 90
+                sensor_uuids.append(camera_config.UUID)
+                setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
+                self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
         self.config.freeze()
 
         if self.config.EVAL.SAVE_RESULTS:
