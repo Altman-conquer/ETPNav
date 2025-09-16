@@ -1,28 +1,29 @@
-import shutil
 import time
 from typing import Any, Dict, Optional, Tuple, List, Union
 
-import habitat_sim
-import math
+import os
 import random
+import time
+from typing import Any, Dict, Optional, Tuple, List, Union
+
+import cv2
 import habitat
+import habitat_sim
+import magnum as mn
+import math
 import numpy as np
 from habitat import Config, Dataset
 from habitat.core.simulator import Observations
+from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat.tasks.utils import cartesian_to_polar
 from habitat.utils.geometry_utils import quaternion_rotate_vector
 from habitat_baselines.common.baseline_registry import baseline_registry
-from habitat.sims.habitat_simulator.actions import HabitatSimActions
-
-from habitat_extensions.maps import drawpoint
-from habitat_extensions.utils import generate_video, heading_from_quaternion, navigator_video_frame, \
-    planner_video_frame, get_frame, UUIDS_EQ
 from scipy.spatial.transform import Rotation as R
-import cv2
-import os
-import magnum as mn
-import open3d as o3d
 
+from habitat_extensions.utils import generate_video, heading_from_quaternion, navigator_video_frame, \
+    planner_video_frame, get_frame
+from vlnce_baselines.map_navigation.rgb_map import rgb_map_habitat_tools
+from vlnce_baselines.map_navigation.semantic_map import semantic_map_habitat_tools
 from vlnce_baselines.waypoint_pred.utils import BALL_COLORS
 
 
@@ -456,12 +457,11 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             self.plan_frames.append(frame)
         return frame
 
-    def get_rgb_frame(self, ghost_positions: list = None, flat = False):
+    def get_rgb_frame(self, ghost_positions: list = None, flat=False):
         agent_state = self._env.sim.get_agent_state()
         observations = self.get_observation_at(agent_state.position, agent_state.rotation)
         rgb = get_frame(observations, flat=flat)
         return rgb
-
 
     def get_depth_frame(self, ghost_positions: list = None):
         agent_state = self._env.sim.get_agent_state()
@@ -500,19 +500,49 @@ class VLNCEDaggerEnv(habitat.RLEnv):
 
         return transform
 
-    def get_top_down_map(self):
-        def get_agent_pose(state):
-            agent_pos = state.position
-            agent_rot = state.rotation
-            heading_vector = quaternion_rotate_vector(
-                agent_rot.inverse(), np.array([0, 0, -1]))
-            phi = cartesian_to_polar(
-                -heading_vector[2], heading_vector[0])[1]
-            angle = phi
-            print(f'agent position = {agent_pos}, angle = {angle}')
-            pose = (agent_pos[0], agent_pos[2], angle)
-            return pose
+    def get_agent_pose(self, state):
+        agent_pos = state.position
+        agent_rot = state.rotation
+        heading_vector = quaternion_rotate_vector(
+            agent_rot.inverse(), np.array([0, 0, -1]))
+        phi = cartesian_to_polar(
+            -heading_vector[2], heading_vector[0])[1]
+        angle = phi
+        print(f'agent position = {agent_pos}, angle = {angle}')
+        pose = (agent_pos[0], agent_pos[2], angle)
+        return pose
 
+    def update_top_down_map(self, rgb_map: rgb_map_habitat_tools, semantic_map: semantic_map_habitat_tools):
+        agent_state = self._env.sim.get_agent_state()
+        observations = self.get_observation_at(agent_state.position, agent_state.rotation)
+
+        rgb_poses = []
+        depth_poses = []
+        rgb_imgs = []
+        depth_imgs = []
+
+        for degree in range(0, 360, 30):
+            postfix = '' if degree == 0 else f'_{degree}'
+
+            depth = observations['depth' + postfix]
+            rgb = observations['rgb' + postfix]
+            # semantic = observations[f'mysemanti_{degree}']
+
+            rgb_poses.append(self.get_agent_pose(agent_state.sensor_states['rgb' + postfix]))
+            depth_poses.append(self.get_agent_pose(agent_state.sensor_states['depth' + postfix]))
+
+            rgb_imgs.append(rgb)
+            depth_imgs.append(depth)
+
+        semantics = semantic_map.detect(rgb_imgs)
+        detect_results = rgb_map.get_detect_result(rgb_imgs)
+
+        for rgb, depth, semantic, pose, detect_result in zip(rgb_imgs, depth_imgs, semantics, depth_poses,
+                                                             detect_results):
+            # rgb_map.build_rgb_map(rgb, depth, detect_result['boxes'], pose, -1)
+            semantic_map.build_semantic_map(detect_result['boxes'], depth, semantic, pose, -1)
+
+    def get_top_down_map(self):
         agent_state = self._env.sim.get_agent_state()
         observations = self.get_observation_at(agent_state.position, agent_state.rotation)
 
@@ -546,8 +576,8 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             rgb = observations['rgb' + postfix]
             semantic = observations[f'mysemanti_{degree}']
 
-            rgb_pose = get_agent_pose(agent_state.sensor_states['rgb' + postfix])
-            depth_pose = get_agent_pose(agent_state.sensor_states['depth' + postfix])
+            rgb_pose = self.get_agent_pose(agent_state.sensor_states['rgb' + postfix])
+            depth_pose = self.get_agent_pose(agent_state.sensor_states['depth' + postfix])
 
             import pickle
 
@@ -665,7 +695,6 @@ class VLNCEDaggerEnv(habitat.RLEnv):
             self.single_step_control(action['ghost_pos'], action['tryout'], vis_info)
             agent_state = self._env.sim.get_agent_state()
             observations = self.get_observation_at(agent_state.position, agent_state.rotation)
-
 
             # 将 observations 中的 uint32 类型转换为 int32
             for k, v in observations.items():

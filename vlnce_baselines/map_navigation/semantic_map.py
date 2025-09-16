@@ -1,12 +1,18 @@
-from math import pi, tan, cos, sin
+import io
+from typing import Union, List
+
+import heapq
+from collections import defaultdict
 
 import cv2
 import numpy as np
-import open3d as o3d
-from matplotlib import pyplot as plt
+import requests
+from PIL import Image
+from math import pi, tan, cos, sin
 from numpy import linalg as LA
 
-from vlnce_baselines.map_navigation.map_utils import find_first_nonzero_elem_per_row, apply_color_to_map
+from vlnce_baselines.map_navigation.map_utils import find_first_nonzero_elem_per_row, apply_color_to_map, \
+    deduplicate_objects, get_ins2cat_dict
 
 
 class semantic_map_habitat_tools:
@@ -14,17 +20,20 @@ class semantic_map_habitat_tools:
     It takes dense observations of the environment and project pixels to the ground.
     """
 
-    def __init__(self, saved_folder):
+    def __init__(self, saved_folder, MIN_DEPTH, MAX_DEPTH):
         from core import cfg
 
         self.scene_name = ''
         self.cell_size = cfg.SEM_MAP.CELL_SIZE
         self.step_size = 1000
         self.map_boundary = 5
-        self.detector = None
         self.saved_folder = saved_folder
 
-        self.IGNORED_CLASS = [0, 1]  # ceiling class is ignored
+        self.MIN_DEPTH = MIN_DEPTH
+        self.MAX_DEPTH = MAX_DEPTH
+
+        # self.IGNORED_CLASS = [0, 1]  # ceiling class is ignored
+        self.IGNORED_CLASS = []  # ceiling class is ignored
 
         # ==================================== initialize 4d grid =================================
         self.min_X = -cfg.SEM_MAP.WORLD_SIZE
@@ -42,8 +51,10 @@ class semantic_map_habitat_tools:
 
         self.four_dim_grid = np.zeros(
             (len(self.z_grid), len(self.y_grid) + 1,
-             len(self.x_grid), cfg.SEM_MAP.GRID_CLASS_SIZE),
+             len(self.x_grid), 140),
             dtype=np.int16)  # x, y, z, C
+
+        # self.occ_map = np.zeros((len(self.z_grid), len(self.x_grid)), dtype=np.int8)
 
         # ===================================
         self.H, self.W = len(self.z_grid), len(self.x_grid)
@@ -53,7 +64,35 @@ class semantic_map_habitat_tools:
         self.max_z_coord = 0
         self.max_y_coord = 0
 
-        self.pcd = o3d.geometry.PointCloud()  # 初始化为 None，后续可赋值为 open3d.geometry.PointCloud()
+        self.object_map = []  # {'position': (x, y, z), 'label': label, 'conf': conf}
+
+    def detect(self, images: List[Union[str, np.ndarray, Image.Image]], server_url="http://127.0.0.1:5000/inference/"):
+        def prepare_image(img: Union[str, np.ndarray, Image.Image]) -> bytes:
+            if isinstance(img, str):
+                image = Image.open(img).convert("RGB")
+            elif isinstance(img, np.ndarray):
+                image = Image.fromarray(img.astype(np.uint8)).convert("RGB")
+            elif isinstance(img, Image.Image):
+                image = img.convert("RGB")
+            else:
+                raise ValueError("不支持的图片类型")
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG")
+            return buf.getvalue()
+
+        files = []
+        results = []
+        batch_size = 100
+        for i in range(0, len(images), batch_size):
+            batch_imgs = images[i:i + batch_size]
+            batch_files = []
+            for idx, img in enumerate(batch_imgs):
+                img_bytes = prepare_image(img)
+                batch_files.append(("images", (f"image{idx + i}.jpg", img_bytes, "image/jpeg")))
+            response = requests.post(server_url, files=batch_files)
+            response.raise_for_status()
+            results.extend(response.json()['results'])
+        return np.array(results)
 
     def convert_insseg_to_sseg(self, insseg, ins2cat_dict):
         """
@@ -66,7 +105,7 @@ class semantic_map_habitat_tools:
             sseg = np.where(insseg == ins_id, ins2cat_dict[ins_id], sseg)
         return sseg
 
-    def project_semantic_pixels_to_world_coords(sseg_img,
+    def project_semantic_pixels_to_world_coords(self, sseg_img,
                                                 current_depth,
                                                 current_pose,
                                                 gap=2,
@@ -109,8 +148,7 @@ class semantic_map_habitat_tools:
         x = range(0, resolution_x, gap)
         y = range(0, resolution_y, gap)
         xv, yv = np.meshgrid(np.array(x), np.array(y))
-        Z = current_depth[yv.flatten(),
-        xv.flatten()].reshape(yv.shape[0], yv.shape[1])
+        Z = current_depth[yv.flatten(), xv.flatten()].reshape(yv.shape[0], yv.shape[1])
         points_4d = np.ones((yv.shape[0], yv.shape[1], 4), np.float32)
         points_4d[:, :, 0] = xv
         points_4d[:, :, 1] = yv
@@ -147,21 +185,88 @@ class semantic_map_habitat_tools:
 
         return points_3d, sseg_points.astype(int)
 
-    def build_semantic_map(self, rgb_img, depth_img, insseg_img, pose, step_):
+    def project_pixels_to_world_coords(self, pixel_points: np.array, current_depth, current_pose, gap=2, FOV=79,
+                                       cx=320,
+                                       cy=240,
+                                       theta_x=0.0,
+                                       resolution_x=640,
+                                       resolution_y=480,
+                                       ignored_colors=[],
+                                       sensor_height=1.5):
+        from math import cos, sin, pi, tan
+        import numpy.linalg as LA
+
+        radian = FOV * pi / 180.
+        focal_length = cx / tan(radian / 2)
+        K = np.array([[focal_length, 0, cx], [0, focal_length, cy], [0, 0, 1]])
+        inv_K = LA.inv(K)
+        tx, tz, theta = current_pose
+
+        R_y = np.array([[cos(theta), 0, sin(theta)], [0, 1, 0],
+                        [-sin(theta), 0, cos(theta)]])
+        R_x = np.array([[1, 0, 0], [0, cos(theta_x), -sin(theta_x)],
+                        [0, sin(theta_x), cos(theta_x)]])
+        R = R_y.dot(R_x)
+        T = np.array([tx, 0, tz])
+        transformation_matrix = np.empty((3, 4))
+        transformation_matrix[:3, :3] = R
+        transformation_matrix[:3, 3] = T
+
+        # pixel_points: (N, 2), 每行是(u, v)
+        u = pixel_points[:, 0]
+        v = pixel_points[:, 1]
+        Z = current_depth[v, u].flatten()  # 添加 .flatten() 确保是1D数组
+        points_4d = np.ones((4, len(u)), np.float32)
+        points_4d[0, :] = u
+        points_4d[1, :] = v
+        points_4d[2, :] = Z
+
+        points_4d[[0, 1, 3], :] = inv_K.dot(points_4d[[0, 1, 3], :])
+        points_4d[0, :] = points_4d[0, :] * points_4d[2, :]
+        points_4d[1, :] = points_4d[1, :] * points_4d[2, :]
+
+        points_3d = transformation_matrix.dot(points_4d)
+        points_3d[1, :] = points_3d[1, :] * -1 + sensor_height
+
+        depth_points = Z
+        good = np.logical_and(depth_points > self.MIN_DEPTH,
+                              depth_points < self.MAX_DEPTH)
+
+        return points_3d, good
+
+    def build_semantic_map(self, detect_results: List[dict], depth_img, insseg_img, pose, step_):
         """ update semantic map with observations rgb_img, depth_img, sseg_img and robot pose."""
-        global ins2cat_dict
+        gap = 1
+        resolution_x = 256
 
-        sem_map_pose = (pose[0], -pose[1], -pose[2])  # x, z, theta
+        map_pose = (pose[0], -pose[1], -pose[2])  # x, z, theta
 
-        sseg_img = self.convert_insseg_to_sseg(insseg_img, ins2cat_dict)
+        # sseg_img = self.convert_insseg_to_sseg(insseg_img, get_ins2cat_dict())
+        sseg_img = insseg_img
 
         xyz_points, sseg_points = self.project_semantic_pixels_to_world_coords(
-            sseg_img, depth_img, sem_map_pose, gap=2, FOV=90, cx=128, cy=128, resolution_x=256, resolution_y=256,
+            sseg_img, depth_img, map_pose, gap=2, FOV=90, cx=128, cy=128, resolution_x=256, resolution_y=256,
             ignored_classes=self.IGNORED_CLASS)
 
-        new_point_cloud = o3d.geometry.PointCloud()
-        new_point_cloud.points = o3d.utility.Vector3dVector(xyz_points.T)
-        self.pcd += new_point_cloud
+        for detect_result in detect_results:
+            center = [int((detect_result['xyxy'][0] + detect_result['xyxy'][2]) / 2),
+                      int((detect_result['xyxy'][1] + detect_result['xyxy'][3]) / 2)]
+            center = np.array([center])
+
+            center_points, center_goods = self.project_pixels_to_world_coords(center, depth_img,
+                                                                              map_pose, gap=gap, FOV=90,
+                                                                              cx=128, cy=128,
+                                                                              resolution_x=resolution_x,
+                                                                              resolution_y=256)
+
+            # if detect_result['cls'] not in ['picture']:
+            #     continue
+
+            self.object_map.append({
+                'position': center_points[:3, 0],
+                'label': detect_result['cls'],
+                'conf': detect_result['conf']
+            })
 
         mask_X = np.logical_and(xyz_points[0, :] > self.min_X,
                                 xyz_points[0, :] < self.max_X)
@@ -197,6 +302,86 @@ class semantic_map_habitat_tools:
         if step_ % self.step_size == 0:
             self.get_semantic_map(step_)
 
+    def build_semantic_map_fast(self, detect_results: List[dict], depth_img, insseg_img, pose, step_):
+        """ 优化的语义地图构建函数 """
+        gap = 1
+        resolution_x = 256
+
+        map_pose = (pose[0], -pose[1], -pose[2])  # x, z, theta
+
+        sseg_img = self.convert_insseg_to_sseg(insseg_img, get_ins2cat_dict())
+        # sseg_img = insseg_img
+
+        # 1. 批量处理物体检测结果
+        if detect_results:
+            centers = np.array([[int((result['xyxy'][0] + result['xyxy'][2]) / 2),
+                                 int((result['xyxy'][1] + result['xyxy'][3]) / 2)]
+                                for result in detect_results])
+
+            # 批量投影所有检测中心点
+            center_points, center_goods = self.project_pixels_to_world_coords(
+                centers, depth_img, map_pose, gap=gap, FOV=90,
+                cx=128, cy=128, resolution_x=resolution_x, resolution_y=256)
+
+            # 批量添加到物体地图
+            valid_indices = np.where(center_goods)[0]
+            for i in valid_indices:
+                self.object_map.append({
+                    'position': center_points[:3, i],
+                    'label': detect_results[i]['cls'],
+                    'conf': detect_results[i]['conf']
+                })
+
+        # 2. 语义点投影（保持原有逻辑）
+        xyz_points, sseg_points = self.project_semantic_pixels_to_world_coords(
+            sseg_img, depth_img, map_pose, gap=2, FOV=90, cx=128, cy=128,
+            resolution_x=256, resolution_y=256, ignored_classes=self.IGNORED_CLASS)
+
+        # 3. 优化边界检查 - 使用向量化操作
+        mask_XYZ = ((xyz_points[0, :] > self.min_X) & (xyz_points[0, :] < self.max_X) &
+                    (xyz_points[2, :] > self.min_Z) & (xyz_points[2, :] < self.max_Z))
+
+        if not np.any(mask_XYZ):
+            return  # 没有有效点，直接返回
+
+        xyz_points = xyz_points[:, mask_XYZ]
+        sseg_points = sseg_points[mask_XYZ]
+
+        # 4. 批量坐标转换
+        x_coord = ((xyz_points[0, :] - self.min_X) / self.cell_size).astype(int)
+        y_coord = np.digitize(xyz_points[1, :], self.y_grid)
+        z_coord = (self.H - 1) - ((xyz_points[2, :] - self.min_Z) / self.cell_size).astype(int)
+
+        # 5. 使用numpy的高效累加
+        if x_coord.shape[0] > 0:
+            # 确保坐标在有效范围内
+            valid_mask = ((x_coord >= 0) & (x_coord < self.W) &
+                          (z_coord >= 0) & (z_coord < self.H) &
+                          (y_coord >= 0) & (y_coord < len(self.y_grid) + 1))
+
+            if np.any(valid_mask):
+                x_coord = x_coord[valid_mask]
+                y_coord = y_coord[valid_mask]
+                z_coord = z_coord[valid_mask]
+                sseg_points = sseg_points[valid_mask]
+
+                # 使用numpy.add.at进行高效累加
+                np.add.at(self.four_dim_grid, (z_coord, y_coord, x_coord, sseg_points), 1)
+
+                # 6. 优化边界更新 - 减少函数调用
+                x_min, x_max = np.min(x_coord), np.max(x_coord)
+                z_min, z_max = np.min(z_coord), np.max(z_coord)
+
+                self.min_x_coord = min(max(x_min - self.map_boundary, 0), self.min_x_coord)
+                self.max_x_coord = max(min(x_max + self.map_boundary, self.W - 1), self.max_x_coord)
+                self.min_z_coord = min(max(z_min - self.map_boundary, 0), self.min_z_coord)
+                self.max_z_coord = max(min(z_max + self.map_boundary, self.H - 1), self.max_z_coord)
+                self.max_y_coord = max(np.max(y_coord), self.max_y_coord)
+
+        # 7. 条件检查地图保存
+        if step_ % self.step_size == 0:
+            self.get_semantic_map(step_)
+
     def get_semantic_map(self, step_):
         """ get the built semantic map. """
         smaller_four_dim_grid = self.four_dim_grid[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
@@ -210,7 +395,7 @@ class semantic_map_habitat_tools:
 
         semantic_map = find_first_nonzero_elem_per_row(zxy_grid)
         semantic_map = semantic_map.reshape(L, M)
-        color_semantic_map = apply_color_to_map(semantic_map)
+        color_semantic_map = apply_color_to_map(semantic_map, dataset='ONEFORMER')
 
         if semantic_map.shape[0] > 0:
             self.save_sem_map_through_plt(
@@ -219,16 +404,19 @@ class semantic_map_habitat_tools:
 
     def save_sem_map_through_plt(self, img, name):
         """ save the figure img at directory 'name' using matplotlib"""
-        fig, ax = plt.subplots(nrows=1, ncols=1)
-        ax.imshow(img)
-        ax.get_xaxis().set_visible(False)
-        ax.get_yaxis().set_visible(False)
-        fig.tight_layout()
-        fig.savefig(name)
-        plt.close()
+        # fig, ax = plt.subplots(nrows=1, ncols=1)
+        # ax.imshow(img)
+        # ax.get_xaxis().set_visible(False)
+        # ax.get_yaxis().set_visible(False)
+        # fig.tight_layout()
+        # fig.savefig(name)
+        # plt.close()
+        cv2.imwrite(name, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
-    def save_final_map(self, ENLARGE_SIZE=5):
+    def save_final_map(self, ENLARGE_SIZE=1, display_object_classes: list = None):
         """ save the built semantic map to a figure."""
+        self.object_map = deduplicate_objects(self.object_map)
+
         smaller_four_dim_grid = self.four_dim_grid[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
                                 self.min_x_coord:self.max_x_coord + 1, :]
         # argmax over the category axis
@@ -241,26 +429,985 @@ class semantic_map_habitat_tools:
         semantic_map = find_first_nonzero_elem_per_row(zxy_grid)
         semantic_map = semantic_map.reshape(L, M)
 
-        map_dict = {}
-        map_dict['min_x'] = self.min_x_coord
-        map_dict['max_x'] = self.max_x_coord
-        map_dict['min_z'] = self.min_z_coord
-        map_dict['max_z'] = self.max_z_coord
-        map_dict['min_X'] = self.min_X
-        map_dict['max_X'] = self.max_X
-        map_dict['min_Z'] = self.min_Z
-        map_dict['max_Z'] = self.max_Z
-        map_dict['W'] = self.W
-        map_dict['H'] = self.H
-        map_dict['semantic_map'] = semantic_map
-        print(f'semantic_map.shape = {semantic_map.shape}')
-        np.save(f'{self.saved_folder}/BEV_semantic_map.npy', map_dict)
+        occ_map = np.zeros((L, M, 3), dtype=np.uint8)
+        occ_map[semantic_map != 0] = (255, 255, 255)
+        # for cls in [87, 122, 132]:
+        #     occ_map[semantic_map == cls] = (255, 255, 255)
+        # mask = (occ_map[:, :, 0] == 0) & (semantic_map != 0)
+        # occ_map[mask] = (128, 128, 128)
 
-        semantic_map = cv2.resize(
-            semantic_map,
-            (int(semantic_map.shape[1] * ENLARGE_SIZE),
-             int(semantic_map.shape[0] * ENLARGE_SIZE)),
-            interpolation=cv2.INTER_NEAREST)
-        color_semantic_map = apply_color_to_map(semantic_map)
+        np.save(f'{self.saved_folder}/BEV_occ_map_raw.npy', occ_map)
+
+        # save map v1
+        # map_dict = {}
+        # map_dict['min_x'] = self.min_x_coord
+        # map_dict['max_x'] = self.max_x_coord
+        # map_dict['min_z'] = self.min_z_coord
+        # map_dict['max_z'] = self.max_z_coord
+        # map_dict['min_X'] = self.min_X
+        # map_dict['max_X'] = self.max_X
+        # map_dict['min_Z'] = self.min_Z
+        # map_dict['max_Z'] = self.max_Z
+        # map_dict['W'] = self.W
+        # map_dict['H'] = self.H
+        # map_dict['semantic_map'] = semantic_map
+        # print(f'semantic_map.shape = {semantic_map.shape}')
+        # np.save(f'{self.saved_folder}/BEV_semantic_map.npy', map_dict)
+
+        # save map v2
+        self._save_complete_map()
+
+        if ENLARGE_SIZE != 1:
+            semantic_map = cv2.resize(
+                semantic_map,
+                (int(semantic_map.shape[1] * ENLARGE_SIZE),
+                 int(semantic_map.shape[0] * ENLARGE_SIZE)),
+                interpolation=cv2.INTER_NEAREST)
+        color_semantic_map = apply_color_to_map(semantic_map, dataset='ONEFORMER')
+
+        self.draw_objects_with_non_overlapping_labels(color_semantic_map, ENLARGE_SIZE,
+                                                      display_object_classes=display_object_classes)
+
         self.save_sem_map_through_plt(color_semantic_map,
-                                 f'{self.saved_folder}/final_semantic_map.jpg')
+                                      f'{self.saved_folder}/final_semantic_map.jpg')
+
+        self.save_sem_map_through_plt(occ_map,
+                                      f'{self.saved_folder}/occ_map.jpg')
+
+    def draw_objects_with_non_overlapping_labels(self, rgb_map, ENLARGE_SIZE=5, display_object_classes: list = None):
+        """在地图上绘制物体，避免标签重叠"""
+        drawn_labels = []  # 存储已绘制的标签位置和尺寸
+
+        for obj in self.object_map:
+            pos = obj['position']
+            label = obj['label']
+            conf = obj.get('conf', 1.0)
+
+            if display_object_classes is not None and label not in display_object_classes:
+                continue
+
+            # 世界坐标转地图坐标
+            x_map = int((pos[0] - self.min_X) / self.cell_size - self.min_x_coord) * ENLARGE_SIZE
+            z_map = int((self.H - 1 - (pos[2] - self.min_Z) / self.cell_size) - self.min_z_coord) * ENLARGE_SIZE
+
+            if 0 <= x_map < rgb_map.shape[1] and 0 <= z_map < rgb_map.shape[0]:
+                # 绘制圆点
+                cv2.circle(rgb_map, (x_map, z_map), 5 * ENLARGE_SIZE, (255, 0, 0), -1)
+
+                # 计算文本尺寸
+                # text = f"{label}({conf:.2f})"
+                text = f"{label}"
+                font_scale = 2
+                # thickness = max(1, int(ENLARGE_SIZE)
+                thickness = 2
+                (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+
+                # 寻找不重叠的文本位置
+                text_pos = self._find_non_overlapping_position(
+                    x_map, z_map, text_w, 10, drawn_labels, rgb_map.shape, ENLARGE_SIZE
+                )
+                # text_pos = (x_map + 3 * ENLARGE_SIZE, z_map - 3 * ENLARGE_SIZE)
+
+                # 绘制文本
+                cv2.putText(rgb_map, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale, (255, 255, 255), thickness)
+
+                # 记录已绘制的标签区域
+                drawn_labels.append({
+                    'x': text_pos[0],
+                    'y': text_pos[1],
+                    'w': text_w,
+                    'h': text_h
+                })
+
+    def _find_non_overlapping_position(self, center_x, center_y, text_w, text_h, drawn_labels, map_shape, ENLARGE_SIZE):
+        """寻找不重叠的文本位置（仅向下偏移）"""
+        # 只向下偏移，避免左右偏移
+        max_attempts = 10
+        for i in range(max_attempts):
+            offset_y = (i * (text_h)) * ENLARGE_SIZE
+            candidate_x = center_x
+            candidate_y = center_y + offset_y
+
+            # 检查是否在地图范围内
+            if (candidate_x < 0 or candidate_x + text_w >= map_shape[1] or
+                    candidate_y - text_h < 0 or candidate_y >= map_shape[0]):
+                continue
+
+            # 检查是否与已有标签重叠
+            overlap = False
+            for drawn in drawn_labels:
+                if self._rectangles_overlap(
+                        candidate_x, candidate_y - text_h, text_w, text_h,
+                        drawn['x'], drawn['y'] - drawn['h'], drawn['w'], drawn['h']
+                ):
+                    overlap = True
+                    break
+
+            if not overlap:
+                return (candidate_x, candidate_y)
+
+        # 如果都重叠，返回默认位置
+        return (center_x, center_y + 10 * ENLARGE_SIZE)
+
+    def _rectangles_overlap(self, x1, y1, w1, h1, x2, y2, w2, h2):
+        """检查两个矩形是否重叠"""
+        return not (x1 + w1 < x2 or x2 + w2 < x1 or y1 + h1 < y2 or y2 + h2 < y1)
+
+    def _save_complete_map(self):
+        """完整保存地图数据，包括所有必要信息用于后续加载"""
+        smaller_four_dim_grid = self.four_dim_grid[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
+                                self.min_x_coord:self.max_x_coord + 1, :]
+
+        map_dict = {
+            # 坐标边界信息
+            'min_x_coord': self.min_x_coord,
+            'max_x_coord': self.max_x_coord,
+            'min_z_coord': self.min_z_coord,
+            'max_z_coord': self.max_z_coord,
+            'max_y_coord': self.max_y_coord,
+
+            # 世界坐标系信息
+            'min_X': self.min_X,
+            'max_X': self.max_X,
+            'min_Z': self.min_Z,
+            'max_Z': self.max_Z,
+            'min_Y': self.min_Y,
+            'max_Y': self.max_Y,
+
+            # 地图尺寸和参数
+            'W': self.W,
+            'H': self.H,
+            'cell_size': self.cell_size,
+            'THRESHOLD_HIGH': self.THRESHOLD_HIGH,
+
+            # 网格信息
+            'x_grid': self.x_grid,
+            'z_grid': self.z_grid,
+            'y_grid': self.y_grid,
+
+            # 完整的四维网格数据
+            'smaller_four_dim_grid': smaller_four_dim_grid,
+
+            # 物体地图
+            'object_map': self.object_map,
+
+            # 其他参数
+            'MIN_DEPTH': self.MIN_DEPTH,
+            'MAX_DEPTH': self.MAX_DEPTH,
+            'IGNORED_CLASS': self.IGNORED_CLASS,
+            'scene_name': self.scene_name
+        }
+
+        np.save(f'{self.saved_folder}/BEV_semantic_map.npy', map_dict)
+        print(f'完整地图数据已保存到 {self.saved_folder}/BEV_semantic_map.npy')
+
+    def load_complete_map(self, map_file):
+        """从文件加载完整的地图数据"""
+        try:
+            map_dict: dict = np.load(map_file, allow_pickle=True).item()
+
+            # 恢复坐标边界信息
+            self.min_x_coord = map_dict['min_x_coord']
+            self.max_x_coord = map_dict['max_x_coord']
+            self.min_z_coord = map_dict['min_z_coord']
+            self.max_z_coord = map_dict['max_z_coord']
+            self.max_y_coord = map_dict['max_y_coord']
+
+            # 恢复世界坐标系信息
+            self.min_X = map_dict['min_X']
+            self.max_X = map_dict['max_X']
+            self.min_Z = map_dict['min_Z']
+            self.max_Z = map_dict['max_Z']
+            self.min_Y = map_dict['min_Y']
+            self.max_Y = map_dict['max_Y']
+
+            # 恢复地图尺寸和参数
+            self.W = map_dict['W']
+            self.H = map_dict['H']
+            self.cell_size = map_dict['cell_size']
+            self.THRESHOLD_HIGH = map_dict['THRESHOLD_HIGH']
+
+            # 恢复网格信息
+            self.x_grid = map_dict['x_grid']
+            self.z_grid = map_dict['z_grid']
+            self.y_grid = map_dict['y_grid']
+
+            # 重新初始化完整的四维网格
+            self.four_dim_grid = np.zeros(
+                (len(self.z_grid), len(self.y_grid) + 1,
+                 len(self.x_grid), 140),
+                dtype=np.int16)
+
+            # 从smaller_four_dim_grid恢复数据到four_dim_grid
+            smaller_four_dim_grid = map_dict['smaller_four_dim_grid']
+            self.four_dim_grid[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
+            self.min_x_coord:self.max_x_coord + 1, :] = smaller_four_dim_grid
+
+            # 恢复物体地图
+            self.object_map = map_dict['object_map']
+
+            # 恢复其他参数
+            self.MIN_DEPTH = map_dict['MIN_DEPTH']
+            self.MAX_DEPTH = map_dict['MAX_DEPTH']
+            self.IGNORED_CLASS = map_dict['IGNORED_CLASS']
+            self.scene_name = map_dict['scene_name']
+
+            print(f'完整地图数据已从 {map_file} 加载成功')
+            return True
+
+        except Exception as e:
+            print(f'加载地图数据失败: {e}')
+            return False
+
+    def world_to_map_coords(self, world_position_3d):
+        """
+        将3维世界坐标转换为2维地图坐标
+
+        Args:
+            world_x (float): 世界坐标X
+            world_y (float): 世界坐标Y (高度)
+            world_z (float): 世界坐标Z
+
+        Returns:
+            tuple: (map_x, map_z, y_layer) 地图坐标x, z和对应的高度层
+            如果坐标超出地图范围，返回 (None, None, None)
+        """
+        world_x, world_y, world_z = world_position_3d
+
+        # 检查是否在世界坐标范围内
+        if (world_x < self.min_X or world_x >= self.max_X or
+                world_z < self.min_Z or world_z >= self.max_Z):
+            return None, None, None
+
+        # 转换为地图网格坐标
+        map_x = int((world_x - self.min_X) / self.cell_size)
+        map_z = (self.H - 1) - int((world_z - self.min_Z) / self.cell_size)
+        y_layer = np.digitize(world_y, self.y_grid)
+
+        # 检查是否在地图网格范围内
+        if (map_x < 0 or map_x >= self.W or
+                map_z < 0 or map_z >= self.H or
+                y_layer < 0 or y_layer > len(self.y_grid)):
+            return None, None, None
+
+        return map_x, map_z, y_layer
+
+    def map_to_world_coords(self, map_x, map_z, map_y=0):
+        """
+        将2维地图坐标转换为3维世界坐标
+
+        Args:
+            map_x (int): 地图坐标X
+            map_z (int): 地图坐标Z
+            map_y (int): 高度层索引，默认为0（地面）
+
+        Returns:
+            tuple: (world_x, world_y, world_z) 世界坐标
+            如果坐标超出范围，返回 (None, None, None)
+        """
+        # 检查地图坐标是否有效
+        if (map_x < 0 or map_x >= self.W or
+                map_z < 0 or map_z >= self.H or
+                map_y < 0 or map_y >= len(self.y_grid)):
+            return None, None, None
+
+        # 转换为世界坐标
+        world_x = self.min_X + map_x * self.cell_size + self.cell_size / 2
+        world_z = self.min_Z + (self.H - 1 - map_z) * self.cell_size + self.cell_size / 2
+        world_y = self.y_grid[map_y] if map_y < len(self.y_grid) else self.y_grid[0]
+
+        return world_x, world_y, world_z
+
+    # def find_path_to(self, start_position_3d, goal_object: str):
+    #     start_position = self.world_to_map_coords(start_position_3d)
+    #     if start_position[0] is None:
+    #         print("起始位置超出地图范围")
+    #         return None
+    #
+    #     goal_object_list = [obj for obj in self.object_map if obj['label'] == goal_object]
+    #     if not goal_object_list:
+    #         print(f"地图中未找到目标物体: {goal_object}")
+    #         return None
+    #
+    #     for goal_object in goal_object_list:
+    #         goal_position = self.world_to_map_coords(goal_object['position'])
+    #
+    def convert_position_from_absolute_to_relative(self, absolute_position_map_2d):
+        """
+        将绝对地图坐标转换为相对于smaller_four_dim_grid的坐标
+        Args:
+            absolute_position_map_2d: (map_x, map_z) 绝对地图坐标
+        Returns:
+            tuple: (rel_x, rel_z) 相对smaller_four_dim_grid的坐标
+            如果超出范围，返回(None, None)
+        """
+        map_x, map_z = absolute_position_map_2d
+        rel_x = map_x - self.min_x_coord
+        rel_z = map_z - self.min_z_coord
+        if rel_x < 0 or rel_x >= (self.max_x_coord - self.min_x_coord + 1):
+            return None, None
+        if rel_z < 0 or rel_z >= (self.max_z_coord - self.min_z_coord + 1):
+            return None, None
+        return rel_x, rel_z
+
+    def convert_position_from_relative_to_absolute(self, relative_position_2d):
+        """
+        将相对于smaller_four_dim_grid的坐标转换为绝对地图坐标
+        Args:
+            relative_position_2d: (rel_x, rel_z) 相对smaller_four_dim_grid的坐标
+        Returns:
+            tuple: (map_x, map_z) 绝对地图坐标
+            如果超出范围，返回(None, None)
+        """
+        rel_x, rel_z = relative_position_2d
+        map_x = rel_x + self.min_x_coord
+        map_z = rel_z + self.min_z_coord
+        if map_x < 0 or map_x >= self.W:
+            return None, None
+        if map_z < 0 or map_z >= self.H:
+            return None, None
+        return map_x, map_z
+
+
+    def _generate_occupancy_map(self, occupancy_threshold=10):
+        """
+        生成2D占用地图，用于路径规划
+
+        Args:
+            occupancy_threshold: 占用判断阈值
+
+        Returns:
+            np.ndarray: 2D占用地图，1表示占用，0表示空闲
+        """
+        smaller_four_dim_grid = self.four_dim_grid[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
+                                self.min_x_coord:self.max_x_coord + 1, :]
+        # argmax over the category axis
+        zyx_grid = np.argmax(smaller_four_dim_grid, axis=3)
+        # swap y dim to the last axis
+        zxy_grid = np.swapaxes(zyx_grid, 1, 2)
+        L, M, N = zxy_grid.shape
+        zxy_grid = zxy_grid.reshape(L * M, N)
+
+        semantic_map = find_first_nonzero_elem_per_row(zxy_grid)
+        semantic_map = semantic_map.reshape(L, M)
+
+        occ_map = np.zeros((L, M), dtype=np.uint8)
+        # occ_map[np.logical_or.reduce((semantic_map == 87, semantic_map == 122, semantic_map == 132))] = 1
+        # for cls in [87, 122, 132]:
+        #     occ_map[semantic_map == cls] = 1
+        # mask = (occ_map[:, :, 0] == 0) & (semantic_map != 0)
+        # occ_map[mask] = (128, 128, 128)
+        occ_map[semantic_map != 0] = 1
+        return occ_map
+
+    def find_path_to(self, start_position_3d, goal_object: str):
+        """
+        使用A*算法寻找从起始位置到目标物体的最优路径
+
+        Args:
+            start_position_3d: 起始位置的3D世界坐标 (x, y, z)
+            goal_object: 目标物体的类别名称
+
+        Returns:
+            list: 路径点列表，每个点为世界坐标；如果无法到达返回None
+        """
+        start_position = self.world_to_map_coords(start_position_3d)
+        start_position = self.convert_position_from_absolute_to_relative(start_position[:2])
+        if start_position[0] is None:
+            print("起始位置超出地图范围")
+            return None
+
+        goal_object_list = [obj for obj in self.object_map if obj['label'] == goal_object]
+        if not goal_object_list:
+            print(f"地图中未找到目标物体: {goal_object}")
+            return None
+
+        # 生成占用地图
+        occ_map = self._generate_occupancy_map()
+
+        best_path = None
+        shortest_distance = float('inf')
+
+        for goal_obj in goal_object_list:
+            goal_position = self.world_to_map_coords(goal_obj['position'])
+            goal_position = self.convert_position_from_absolute_to_relative(goal_position[:2])
+            if goal_position[0] is None:
+                continue
+
+            # A*算法使用相对坐标 (rel_x, rel_z)
+            path = self._astar_search(start_position, goal_position, occ_map)
+
+            if path and len(path) < shortest_distance:
+                best_path = path
+                shortest_distance = len(path)
+
+        if best_path:
+            # 可视化路径
+            self.visualize_path(best_path, goal_object,
+                                save_path=f"{self.saved_folder}/path_{goal_object}.jpg")
+
+            # 转换为世界坐标路径
+            world_path = []
+            for rel_x, rel_z in best_path:
+                abs_x, abs_z = self.convert_position_from_relative_to_absolute((rel_x, rel_z))
+                if abs_x is not None:
+                    world_coords = self.map_to_world_coords(abs_x, abs_z, 0)
+                    if world_coords[0] is not None:
+                        world_path.append(world_coords)
+            return world_path
+
+        print(f"无法找到到达目标物体 {goal_object} 的路径")
+        return None
+
+    def find_path_to_area_around_object(self, start_position_3d, goal_object: str, search_radius=5):
+        """
+        使用A*算法寻找从起始位置到目标物体周围区域的最优路径
+
+        Args:
+            start_position_3d: 起始位置的3D世界坐标 (x, y, z)
+            goal_object: 目标物体的类别名称
+            search_radius: 搜索半径，向外扩展的格子数
+
+        Returns:
+            dict: 包含路径信息的字典，如果无法到达返回None
+        """
+        start_position = self.world_to_map_coords(start_position_3d)
+        start_position = self.convert_position_from_absolute_to_relative(start_position[:2])
+        if start_position[0] is None:
+            print("起始位置超出地图范围")
+            return None
+
+        goal_object_list = [obj for obj in self.object_map if obj['label'] == goal_object]
+        if not goal_object_list:
+            print(f"地图中未找到目标物体: {goal_object}")
+            return None
+
+        # 生成占用地图
+        occ_map = self._generate_occupancy_map()
+
+        best_result = None
+        shortest_distance = float('inf')
+
+        for goal_obj in goal_object_list:
+            goal_center = self.world_to_map_coords(goal_obj['position'])
+            goal_center = self.convert_position_from_absolute_to_relative(goal_center[:2])
+
+            if goal_center[0] is None:
+                continue
+
+            # 生成目标周围的候选位置
+            candidate_goals = self._generate_area_around_position(goal_center, search_radius, occ_map)
+
+            if not candidate_goals:
+                print(f"目标物体 {goal_object} 周围无可达区域")
+                continue
+
+            # 对每个候选位置尝试寻路
+            for candidate_goal in candidate_goals:
+                # start_position 和 candidate_goal 都已经是相对坐标 (rel_x, rel_z)
+                path = self._astar_search(start_position, candidate_goal, occ_map)
+
+                if path and len(path) < shortest_distance:
+                    best_result = {
+                        'path': path,
+                        'goal_position': candidate_goal,
+                        'goal_object_center': goal_center,
+                        'target_object': goal_obj,
+                        'path_length': len(path),
+                        'distance_to_object': self._calculate_distance(candidate_goal, goal_center)
+                    }
+                    shortest_distance = len(path)
+
+        if best_result:
+            # 可视化最佳路径
+            self.visualize_path(best_result['path'], goal_object,
+                                goal_center=best_result['goal_object_center'],
+                                search_radius=search_radius,
+                                save_path=f"{self.saved_folder}/path_to_area_{goal_object}.jpg")
+
+            print(f"找到到达 {goal_object} 周围的路径，长度: {best_result['path_length']}")
+            return best_result
+        else:
+            print(f"无法找到到达目标物体 {goal_object} 周围区域的路径")
+            return None
+
+    def _generate_area_around_position(self, center_position, radius, occ_map):
+        """
+        生成目标位置周围一圈的候选位置
+
+        Args:
+            center_position: 中心位置 (rel_x, rel_z)
+            radius: 搜索半径
+            occ_map: 占用地图
+
+        Returns:
+            list: 可达的候选位置列表，按距离中心的距离排序
+        """
+        center_x, center_z = center_position
+        candidates = []
+
+        # 生成周围一圈的位置
+        for r in range(1, radius + 1):  # 从1开始，不包括中心点
+            for dz in range(-r, r + 1):
+                for dx in range(-r, r + 1):
+                    # 只选择距离中心为r的点（圆形边界）
+                    if abs(dx) + abs(dz) != r:
+                        continue
+
+                    candidate_x = center_x + dx
+                    candidate_z = center_z + dz
+
+                    # 检查是否在地图范围内
+                    if (0 <= candidate_z < occ_map.shape[0] and
+                            0 <= candidate_x < occ_map.shape[1]):
+
+                        # 检查是否是空闲区域
+                        if occ_map[candidate_z, candidate_x] == 0:
+                            distance = np.sqrt(dx * dx + dz * dz)
+                            candidates.append({
+                                'position': (candidate_x, candidate_z),
+                                'distance': distance
+                            })
+
+        # 按距离排序，优先选择离中心较近的位置
+        candidates.sort(key=lambda x: x['distance'])
+
+        return [candidate['position'] for candidate in candidates]
+
+    def _calculate_distance(self, pos1, pos2):
+        """计算两个位置之间的距离"""
+        dx = pos1[0] - pos2[0]
+        dz = pos1[1] - pos2[1]
+        return np.sqrt(dx * dx + dz * dz)
+
+    def visualize_path(self, path, goal_object, goal_center=None, search_radius=None, save_path=None):
+        """
+        改进的路径可视化函数，支持显示搜索区域
+
+        Args:
+            path: 路径点列表 [(rel_x, rel_z), ...]
+            goal_object: 目标物体名称
+            goal_center: 目标物体中心位置 (rel_x, rel_z)
+            search_radius: 搜索半径
+            save_path: 保存路径
+        """
+        # 获取语义地图
+        smaller_four_dim_grid = self.four_dim_grid[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
+                                self.min_x_coord:self.max_x_coord + 1, :]
+
+        # 生成语义地图
+        zyx_grid = np.argmax(smaller_four_dim_grid, axis=3)
+        zxy_grid = np.swapaxes(zyx_grid, 1, 2)
+        L, M, N = zxy_grid.shape
+        zxy_grid = zxy_grid.reshape(L * M, N)
+
+        semantic_map = find_first_nonzero_elem_per_row(zxy_grid)
+        semantic_map = semantic_map.reshape(L, M)
+
+        # 应用颜色映射
+        color_semantic_map = apply_color_to_map(semantic_map, dataset='ONEFORMER')
+
+        # 放大地图
+        ENLARGE_SIZE = 5
+        enlarged_map = cv2.resize(color_semantic_map,
+                                  (color_semantic_map.shape[1] * ENLARGE_SIZE,
+                                   color_semantic_map.shape[0] * ENLARGE_SIZE),
+                                  interpolation=cv2.INTER_NEAREST)
+
+        # 绘制搜索区域（如果提供了中心位置和半径）
+        if goal_center is not None and search_radius is not None:
+            center_x, center_z = goal_center
+
+            # 绘制搜索区域的圆圈
+            for r in range(1, search_radius + 1):
+                circle_color = (100, 100, 255) if r == search_radius else (150, 150, 255)
+                center_point = (center_x * ENLARGE_SIZE + ENLARGE_SIZE // 2,
+                                center_z * ENLARGE_SIZE + ENLARGE_SIZE // 2)
+                cv2.circle(enlarged_map, center_point, r * ENLARGE_SIZE, circle_color, 2)
+
+            # 标记目标物体中心
+            center_point = (center_x * ENLARGE_SIZE + ENLARGE_SIZE // 2,
+                            center_z * ENLARGE_SIZE + ENLARGE_SIZE // 2)
+            cv2.circle(enlarged_map, center_point, ENLARGE_SIZE, (255, 0, 255), -1)  # 紫色中心
+            cv2.putText(enlarged_map, f'{goal_object}_CENTER',
+                        (center_point[0] - 30, center_point[1] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # 绘制路径
+        if path and len(path) > 1:
+            path_color = (0, 255, 0)  # 绿色路径
+            path_thickness = max(2, ENLARGE_SIZE // 2)
+
+            # 绘制路径线段
+            for i in range(len(path) - 1):
+                pt1 = (path[i][0] * ENLARGE_SIZE + ENLARGE_SIZE // 2,
+                       path[i][1] * ENLARGE_SIZE + ENLARGE_SIZE // 2)
+                pt2 = (path[i + 1][0] * ENLARGE_SIZE + ENLARGE_SIZE // 2,
+                       path[i + 1][1] * ENLARGE_SIZE + ENLARGE_SIZE // 2)
+                cv2.line(enlarged_map, pt1, pt2, path_color, path_thickness)
+
+            # 绘制路径点
+            for i, (rel_x, rel_z) in enumerate(path):
+                center = (rel_x * ENLARGE_SIZE + ENLARGE_SIZE // 2,
+                          rel_z * ENLARGE_SIZE + ENLARGE_SIZE // 2)
+
+                if i == 0:  # 起始点
+                    cv2.circle(enlarged_map, center, ENLARGE_SIZE, (255, 0, 0), -1)  # 红色
+                    cv2.putText(enlarged_map, 'START',
+                                (center[0] - 20, center[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                elif i == len(path) - 1:  # 终点
+                    cv2.circle(enlarged_map, center, ENLARGE_SIZE, (0, 0, 255), -1)  # 蓝色
+                    cv2.putText(enlarged_map, 'TARGET_AREA',
+                                (center[0] - 30, center[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                else:  # 中间路径点
+                    cv2.circle(enlarged_map, center, ENLARGE_SIZE // 2, (255, 255, 0), -1)  # 黄色
+
+        # 添加图例
+        legend_height = 120
+        legend_map = np.zeros((legend_height, enlarged_map.shape[1], 3), dtype=np.uint8)
+
+        legend_items = [
+            ("START (Red)", (255, 0, 0)),
+            ("TARGET_AREA (Blue)", (0, 0, 255)),
+            ("PATH (Green)", (0, 255, 0)),
+            ("OBJECT_CENTER (Purple)", (255, 0, 255)),
+            ("SEARCH_AREA (Light Blue)", (100, 100, 255))
+        ]
+
+        for i, (text, color) in enumerate(legend_items):
+            y_pos = 20 + i * 20
+            cv2.circle(legend_map, (20, y_pos), 8, color, -1)
+            cv2.putText(legend_map, text, (40, y_pos + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # 合并地图和图例
+        final_map = np.vstack([enlarged_map, legend_map])
+
+        # 保存图片
+        if save_path:
+            cv2.imwrite(save_path, cv2.cvtColor(final_map, cv2.COLOR_RGB2BGR))
+            print(f"区域路径可视化图已保存到: {save_path}")
+
+        return final_map
+
+    def get_path_to_object_area(self, start_position_3d, goal_object: str, search_radius=3, smooth=True):
+        """
+        获取到目标物体周围区域的完整路径信息
+
+        Args:
+            start_position_3d: 起始3D位置
+            goal_object: 目标物体类别
+            search_radius: 搜索半径
+            smooth: 是否进行路径平滑
+
+        Returns:
+            dict: 包含路径信息的字典
+        """
+        result = self.find_path_to_area_around_object(start_position_3d, goal_object, search_radius)
+
+        if result is None:
+            return {
+                'success': False,
+                'path': None,
+                'path_length': 0,
+                'message': f'无法找到到达 {goal_object} 周围区域的路径'
+            }
+
+        path = result['path']
+
+        # 路径平滑处理
+        if smooth and len(path) > 2:
+            occ_map = self._generate_occupancy_map()
+            smoothed_path = self._smooth_path_relative(path, occ_map)
+            path = smoothed_path
+
+        # 计算路径长度（世界坐标）
+        path_length = 0
+        for i in range(len(path) - 1):
+            # 转换为世界坐标计算实际距离
+            abs_pos1 = self.convert_position_from_relative_to_absolute(path[i])
+            abs_pos2 = self.convert_position_from_relative_to_absolute(path[i + 1])
+
+            if abs_pos1[0] is not None and abs_pos2[0] is not None:
+                world_pos1 = self.map_to_world_coords(abs_pos1[0], abs_pos1[1], 0)
+                world_pos2 = self.map_to_world_coords(abs_pos2[0], abs_pos2[1], 0)
+
+                if world_pos1[0] is not None and world_pos2[0] is not None:
+                    dx = world_pos2[0] - world_pos1[0]
+                    dz = world_pos2[2] - world_pos1[2]
+                    path_length += np.sqrt(dx * dx + dz * dz)
+
+        return {
+            'success': True,
+            'path': path,
+            'path_length': path_length,
+            'num_waypoints': len(path),
+            'target_area_position': result['goal_position'],
+            'object_center_position': result['goal_object_center'],
+            'distance_to_object': result['distance_to_object'],
+            'search_radius': search_radius,
+            'message': f'成功找到到达 {goal_object} 周围区域的路径'
+        }
+
+    def _astar_search(self, start, goal, occ_map):
+        """
+        A*算法实现 - 使用相对坐标系统
+
+        Args:
+            start: 起始位置 (rel_x, rel_z)
+            goal: 目标位置 (rel_x, rel_z)
+            occ_map: 占用地图
+
+        Returns:
+            list: 路径点列表 [(rel_x, rel_z), ...] 或None
+        """
+
+        def heuristic(a, b):
+            # 曼哈顿距离作为启发函数
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        def get_neighbors(pos):
+            # 8连通邻域
+            neighbors = []
+            directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+            for dx, dz in directions:
+                new_x, new_z = pos[0] + dx, pos[1] + dz
+
+                # 检查边界 - 使用占用地图的尺寸
+                if (0 <= new_x < occ_map.shape[1] and
+                        0 <= new_z < occ_map.shape[0]):
+
+                    # 检查是否被占用
+                    if occ_map[new_z, new_x] == 0:
+                        # 对角移动的代价更高
+                        cost = 1.414 if dx != 0 and dz != 0 else 1.0
+                        neighbors.append(((new_x, new_z), cost))
+
+            return neighbors
+
+        # 检查起始和目标位置是否有效
+        if (start[0] < 0 or start[0] >= occ_map.shape[1] or
+                start[1] < 0 or start[1] >= occ_map.shape[0] or
+                goal[0] < 0 or goal[0] >= occ_map.shape[1] or
+                goal[1] < 0 or goal[1] >= occ_map.shape[0]):
+            return None
+
+        if occ_map[start[1], start[0]] == 1 or occ_map[goal[1], goal[0]] == 1:
+            return None
+
+        # A*算法核心
+        open_set = [(0, start)]
+        came_from = {}
+        g_score = defaultdict(lambda: float('inf'))
+        g_score[start] = 0
+        f_score = defaultdict(lambda: float('inf'))
+        f_score[start] = heuristic(start, goal)
+
+        visited = set()
+
+        while open_set:
+            current_f, current = heapq.heappop(open_set)
+
+            if current in visited:
+                continue
+
+            visited.add(current)
+
+            if current == goal:
+                # 重构路径 - 返回相对坐标
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+
+                # 添加起始位置
+                path.append(start)
+                path.reverse()
+
+                return path
+
+            for neighbor, move_cost in get_neighbors(current):
+                if neighbor in visited:
+                    continue
+
+                tentative_g = g_score[current] + move_cost
+
+                if tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
+
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+        return None
+
+    def _smooth_path_relative(self, path, occ_map):
+        """
+        路径平滑处理 - 直接使用相对坐标
+
+        Args:
+            path: 相对坐标路径点列表 [(rel_x, rel_z), ...]
+            occ_map: 占用地图
+
+        Returns:
+            list: 平滑后的相对坐标路径
+        """
+        if len(path) <= 2:
+            return path
+
+        def line_of_sight(p1, p2):
+            """检查两点间是否有直线视线 - 使用相对坐标"""
+            x1, z1 = p1
+            x2, z2 = p2
+
+            # Bresenham直线算法检查路径上是否有障碍物
+            dx = abs(x2 - x1)
+            dz = abs(z2 - z1)
+            x, z = x1, z1
+            x_inc = 1 if x1 < x2 else -1
+            z_inc = 1 if z1 < z2 else -1
+            error = dx - dz
+
+            while True:
+                if (x < 0 or x >= occ_map.shape[1] or
+                        z < 0 or z >= occ_map.shape[0] or
+                        occ_map[z, x] == 1):
+                    return False
+
+                if x == x2 and z == z2:
+                    break
+
+                error2 = error * 2
+                if error2 > -dz:
+                    error -= dz
+                    x += x_inc
+                if error2 < dx:
+                    error += dx
+                    z += z_inc
+
+            return True
+
+        smoothed_path = [path[0]]
+        current_idx = 0
+
+        while current_idx < len(path) - 1:
+            farthest_idx = current_idx + 1
+
+            # 找到能直接到达的最远点
+            for i in range(current_idx + 2, len(path)):
+                if line_of_sight(path[current_idx], path[i]):
+                    farthest_idx = i
+                else:
+                    break
+
+            smoothed_path.append(path[farthest_idx])
+            current_idx = farthest_idx
+
+        return smoothed_path
+
+    def _smooth_path(self, path, occ_map):
+        """
+        路径平滑处理，减少不必要的转弯
+
+        Args:
+            path: 原始路径点列表
+            occ_map: 占用地图
+
+        Returns:
+            list: 平滑后的路径
+        """
+        if len(path) <= 2:
+            return path
+
+        def line_of_sight(p1, p2):
+            """检查两点间是否有直线视线"""
+            x1, z1 = p1[0] - self.min_x_coord, p1[1] - self.min_z_coord
+            x2, z2 = p2[0] - self.min_x_coord, p2[1] - self.min_z_coord
+
+            # Bresenham直线算法检查路径上是否有障碍物
+            dx = abs(x2 - x1)
+            dz = abs(z2 - z1)
+            x, z = x1, z1
+            x_inc = 1 if x1 < x2 else -1
+            z_inc = 1 if z1 < z2 else -1
+            error = dx - dz
+
+            while True:
+                if (x < 0 or x >= occ_map.shape[1] or
+                        z < 0 or z >= occ_map.shape[0] or
+                        occ_map[z, x] == 1):
+                    return False
+
+                if x == x2 and z == z2:
+                    break
+
+                error2 = error * 2
+                if error2 > -dz:
+                    error -= dz
+                    x += x_inc
+                if error2 < dx:
+                    error += dx
+                    z += z_inc
+
+            return True
+
+        smoothed_path = [path[0]]
+        current_idx = 0
+
+        while current_idx < len(path) - 1:
+            farthest_idx = current_idx + 1
+
+            # 找到能直接到达的最远点
+            for i in range(current_idx + 2, len(path)):
+                if line_of_sight(path[current_idx], path[i]):
+                    farthest_idx = i
+                else:
+                    break
+
+            smoothed_path.append(path[farthest_idx])
+            current_idx = farthest_idx
+
+        return smoothed_path
+
+    def get_path_with_smoothing(self, start_position_3d, goal_object: str, smooth=True):
+        """
+        获取平滑路径的完整接口
+
+        Args:
+            start_position_3d: 起始3D位置
+            goal_object: 目标物体类别
+            smooth: 是否进行路径平滑
+
+        Returns:
+            dict: 包含路径信息的字典
+        """
+        # 获取原始路径
+        path = self.find_path_to(start_position_3d, goal_object)
+
+        if path is None:
+            return {
+                'success': False,
+                'path': None,
+                'path_length': 0,
+                'message': f'无法找到到达 {goal_object} 的路径'
+            }
+
+        # 计算路径长度
+        path_length = 0
+        for i in range(len(path) - 1):
+            dx = path[i + 1][0] - path[i][0]
+            dz = path[i + 1][2] - path[i][2]
+            path_length += np.sqrt(dx * dx + dz * dz)
+
+        return {
+            'success': True,
+            'path': path,
+            'path_length': path_length,
+            'num_waypoints': len(path),
+            'message': f'成功找到到达 {goal_object} 的路径'
+        }
+

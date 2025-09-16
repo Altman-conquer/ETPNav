@@ -14,7 +14,8 @@ from habitat.tasks.utils import cartesian_to_polar
 from habitat.utils.geometry_utils import quaternion_rotate_vector
 from matplotlib import pyplot as plt
 from numpy import linalg as LA
-from sklearn.cluster import DBSCAN
+
+from vlnce_baselines.map_navigation.map_utils import deduplicate_objects
 
 
 class rgb_map_habitat_tools:
@@ -61,38 +62,11 @@ class rgb_map_habitat_tools:
 
         self.pcd = o3d.geometry.PointCloud()
 
-    # object_map: [{'position': (x, y, z), 'label': label, ...}, ...]
-    @staticmethod
-    def deduplicate_objects(object_map, eps=1.0):
-        unique_objects = []
-        if not object_map:
-            return unique_objects
-        positions = np.array([obj['position'] for obj in object_map])
-        labels = np.array([obj['label'] for obj in object_map])
-        confs = np.array([obj.get('conf', 1.0) for obj in object_map])
-        for inst_id in np.unique(labels):
-            mask = (labels == inst_id)
-            if np.sum(mask) <= 1:
-                continue
-            db = DBSCAN(eps=eps, min_samples=1).fit(positions[mask])
-            cluster_labels = db.labels_
-            for label in set(cluster_labels):
-                cluster_points = positions[mask][cluster_labels == label]
-
-                if len(cluster_points) == 0:
-                    raise ValueError("cluster_confs 为空，无法计算cluster_confs.max()。")
-
-                center = cluster_points.mean(axis=0)
-                cluster_confs = confs[mask][cluster_labels == label]
-                mean_conf = cluster_confs.max()
-                count = len(cluster_points)  # 统计每个聚类中点的个数
-                unique_objects.append({'position': center, 'label': inst_id, 'conf': mean_conf, 'count': count})
-        return unique_objects
-
-    def load_from_npy_folder(self, rgb_dir, depth_dir, semantic_dir, depth_pose_dir, rgb_pose_dir):
+    def load_from_npy_folder(self, rgb_dir, depth_dir, semantic_dir, depth_pose_dir, rgb_pose_dir, max_cnt = -1):
         rgbs, depths, semantics, rgb_cameras, depth_cameras = [], [], [], [], []
         rgb_files = sorted(os.listdir(rgb_dir))
-        for file in rgb_files:
+        for file in rgb_files[:len(rgb_files) if max_cnt == -1 else max_cnt]:
+        # for file in rgb_files[42:43]:
             timestamp = file.replace('.pkl', '')
             with open(os.path.join(rgb_dir, f"{timestamp}.pkl"), "rb") as f:
                 rgb = pickle.load(f)
@@ -297,7 +271,35 @@ class rgb_map_habitat_tools:
 
         return rgb_images, depth_images, semantic_images, cameras
 
-    def get_detect_result(self, rgb_imgs: list):
+    def get_detect_result(self, rgb_imgs: list, extra_class: list = None):
+        # def prepare_image(img: Union[str, np.ndarray, Image.Image]) -> bytes:
+        #     if isinstance(img, str):
+        #         image = Image.open(img).convert("RGB")
+        #     elif isinstance(img, np.ndarray):
+        #         image = Image.fromarray(img.astype(np.uint8)).convert("RGB")
+        #     elif isinstance(img, Image.Image):
+        #         image = img.convert("RGB")
+        #     else:
+        #         raise ValueError("不支持的图片类型")
+        #     buf = io.BytesIO()
+        #     image.save(buf, format="JPEG")
+        #     return buf.getvalue()
+        #
+        # def detect(images: List[Union[str, np.ndarray, Image.Image]], extra_class,
+        #            server_url="http://127.0.0.1:8000/detect/"):
+        #     files = []
+        #     for idx, img in enumerate(images):
+        #         img_bytes = prepare_image(img)
+        #         files.append(("files", (f"image{idx}.jpg", img_bytes, "image/jpeg")))
+        #     # data = []
+        #     # if extra_class:
+        #     #     data = [("extra_class", cls) for cls in extra_class]
+        #     # response = requests.post(server_url, files=files, data=data)
+        #     response = requests.post(server_url, files=files)
+        #     response.raise_for_status()
+        #     return response.json()
+        #
+        # return detect(rgb_imgs, extra_class=extra_class)
         def prepare_image(img: Union[str, np.ndarray, Image.Image]) -> bytes:
             if isinstance(img, str):
                 image = Image.open(img).convert("RGB")
@@ -311,20 +313,23 @@ class rgb_map_habitat_tools:
             image.save(buf, format="JPEG")
             return buf.getvalue()
 
-        def detect(images: List[Union[str, np.ndarray, Image.Image]], extra_class=None,
-                   server_url="http://127.0.0.1:8000/detect/"):
-            files = []
-            for idx, img in enumerate(images):
-                img_bytes = prepare_image(img)
-                files.append(("files", (f"image{idx}.jpg", img_bytes, "image/jpeg")))
-            data = []
-            if extra_class:
-                data = [("extra_class", cls) for cls in extra_class]
-            response = requests.post(server_url, files=files, data=data)
-            response.raise_for_status()
-            return response.json()
+        files = []
+        for idx, img in enumerate(rgb_imgs):
+            img_bytes = prepare_image(img)
+            files.append(("files", (f"image{idx}.jpg", img_bytes, "image/jpeg")))
+        data = []
+        if extra_class:
+            data = [("extra_class", cls) for cls in extra_class]
 
-        return detect(rgb_imgs)
+        results = []
+        batch_size = 1000
+        for i in range(0, len(files), batch_size):
+            batch_files = files[i:i + batch_size]
+            response = requests.post("http://127.0.0.1:8000/detect/", files=batch_files, data=data)
+            response.raise_for_status()
+            results.extend(response.json())
+
+        return results
 
     def build_rgb_map_slow(self, rgb_img, depth_img, detect_results: List[dict], pose, step_):
         """ 用观测rgb_img和depth_img更新RGB地图 """
@@ -495,7 +500,7 @@ class rgb_map_habitat_tools:
 
     def save_final_map(self, ENLARGE_SIZE=5):
         """ 保存最终RGB地图并绘制检测到的物体 """
-        self.object_map = self.deduplicate_objects(self.object_map)
+        self.object_map = deduplicate_objects(self.object_map)
 
         grid_sum = self.four_dim_grid_sum[self.min_z_coord:self.max_z_coord + 1, 0:self.THRESHOLD_HIGH,
                    self.min_x_coord:self.max_x_coord + 1, :]
@@ -526,6 +531,8 @@ class rgb_map_habitat_tools:
         # 放大地图
         rgb_map = cv2.resize(rgb_map, (int(rgb_map.shape[1] * ENLARGE_SIZE), int(rgb_map.shape[0] * ENLARGE_SIZE)),
                              interpolation=cv2.INTER_NEAREST)
+
+        plt.imsave(f'{self.saved_folder}/final_rgb_map.jpg', rgb_map)
 
         self.draw_objects_with_non_overlapping_labels(rgb_map, ENLARGE_SIZE)
 

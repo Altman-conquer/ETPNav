@@ -27,20 +27,28 @@ import os
 import pickle
 
 import cv2
+import habitat_sim
 import magnum as mn
 import numpy as np
+import numpy.linalg as LA
+from PIL import Image
+from habitat_sim.utils import viz_utils as vut
+from matplotlib import pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
-from matplotlib import pyplot as plt
-from PIL import Image
-
-import habitat_sim
-from habitat_sim.utils import viz_utils as vut
-
-import numpy.linalg as LA
-
+from vlnce_baselines.map_navigation.map_utils import init_ins2cat_dict
 from vlnce_baselines.map_navigation.rgb_map import rgb_map_habitat_tools
 from vlnce_baselines.map_navigation.semantic_map import semantic_map_habitat_tools
+
+
+def test_load_semantic_map():
+    semantic_map = semantic_map_habitat_tools(saved_folder='tmp/semantic_map/', MIN_DEPTH=0.0,
+                                              MAX_DEPTH=1.0)
+    semantic_map.load_complete_map('/home/zhandijia/DockerData/zhandijia-root/ETPNav/tmp/semantic_map/BEV_semantic_map.npy')
+    semantic_map.save_final_map(display_object_classes=['hall', 'table', 'open doorway', 'bathroom doorway', 'sink', 'doorway'])
+    semantic_map.find_path_to_area_around_object([0.1025409996509552, 0.17162801325321198, -0.18507200479507446],'table', search_radius=5)
+
+test_load_semantic_map()
 
 data_path = "/home/zhandijia/DockerData/zhandijia-root/ETPNav/data"
 print(f"data_path = {data_path}")
@@ -674,9 +682,10 @@ def create_folder(folder_name, clean_up=False):
 
 
 with habitat_sim.Simulator(cfg) as sim:
-    scene_semantics = sim.semantic_scene  # set([i.name() for i in scene_semantics.categories])
-    ins2cat_dict = {
-        int(obj.id.split("_")[-1]): obj.category.index() for obj in scene_semantics.objects}
+    # init_ins2cat_dict(sim)
+    # scene_semantics = sim.semantic_scene  # set([i.name() for i in scene_semantics.categories])
+    # ins2cat_dict = {
+    #     int(obj.id.split("_")[-1]): obj.category.index() for obj in scene_semantics.objects}
     # get_2d_point(sim, 'rgb', mn.Vector3(0, 0, 0.5))
     init_agent(sim)  # scene_semantics.objects[0].category.index()
     # init_objects(sim)
@@ -692,11 +701,13 @@ with habitat_sim.Simulator(cfg) as sim:
     # rgbs, depths, semantics, depth_cameras = rgb_map.rotate_and_capture(sim, rotate_step=36, move_step=1)
     rgbs, depths, semantics, depth_cameras, _ = rgb_map.load_from_npy_folder("tmp/rgb_images", "tmp/depth_images",
                                                                              "tmp/semantic_images",
-                                                                             "tmp/depth_poses", "tmp/rgb_poses")
+                                                                             "tmp/depth_poses", "tmp/rgb_poses", max_cnt=-1)
 
-    semantic_map = semantic_map_habitat_tools(saved_folder='tmp/semantic_map/')
+    semantic_map = semantic_map_habitat_tools(saved_folder='tmp/semantic_map/', MIN_DEPTH=MIN_DEPTH, MAX_DEPTH=MAX_DEPTH)
 
+    # rgb_map.get_detect_result(['/home/zhandijia/DockerData/zhandijia-root/ETPNav/tmp/rgb_images_png/20250904_103923.png'])
     detect_results = rgb_map.get_detect_result(rgbs)
+    semantics = semantic_map.detect(rgbs)
 
     from collections import Counter
 
@@ -714,11 +725,11 @@ with habitat_sim.Simulator(cfg) as sim:
 
     for rgb, depth, semantic, pose, detect_result in tqdm(zip(rgbs, depths, semantics, depth_cameras, detect_results),
                                                           total=len(rgbs), desc="Processing"):
-        rgb_map.build_rgb_map(rgb, depth, detect_result['boxes'], pose, count_)
-        # semantic_map.build_semantic_map(rgb, depth, semantic, pose, count_)
+        # rgb_map.build_rgb_map(rgb, depth, detect_result['boxes'], pose, count_)
+        semantic_map.build_semantic_map(detect_result['boxes'], depth, semantic, pose, count_)
         count_ += 1
-    rgb_map.save_final_map()
-    # semantic_map.save_final_map()
+    # rgb_map.save_final_map()
+    semantic_map.save_final_map()
 
     # rgbs, depths, depth_cameras, _ = load_from_npy_folder("tmp/rgb_images", "tmp/depth_images", "tmp/depth_poses", "tmp/rgb_poses")
     # pcd = test(sim, rgbs, depths, depth_cameras, save_img=False)
