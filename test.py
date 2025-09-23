@@ -41,14 +41,14 @@ from vlnce_baselines.map_navigation.rgb_map import rgb_map_habitat_tools
 from vlnce_baselines.map_navigation.semantic_map import semantic_map_habitat_tools
 
 
-def test_load_semantic_map():
-    semantic_map = semantic_map_habitat_tools(saved_folder='tmp/semantic_map/', MIN_DEPTH=0.0,
-                                              MAX_DEPTH=1.0)
-    semantic_map.load_complete_map('/home/zhandijia/DockerData/zhandijia-root/ETPNav/tmp/semantic_map/BEV_semantic_map.npy')
-    semantic_map.save_final_map(display_object_classes=['hall', 'table', 'open doorway', 'bathroom doorway', 'sink', 'doorway'])
-    semantic_map.find_path_to_area_around_object([0.1025409996509552, 0.17162801325321198, -0.18507200479507446],'table', search_radius=5)
-
-test_load_semantic_map()
+# def test_load_semantic_map():
+#     semantic_map = semantic_map_habitat_tools(saved_folder='tmp/semantic_map/', MIN_DEPTH=0.0,
+#                                               MAX_DEPTH=1.0)
+#     semantic_map.load_complete_map('/home/zhandijia/DockerData/zhandijia-root/ETPNav/tmp/semantic_map/BEV_semantic_map.npy')
+#     semantic_map.save_final_map(display_object_classes=['hall', 'table', 'open doorway', 'bathroom doorway', 'sink', 'doorway'])
+#     semantic_map.find_path_to_area_around_object([0.1025409996509552, 0.17162801325321198, -0.18507200479507446],'sink', search_radius=25)
+#
+# test_load_semantic_map()
 
 data_path = "/home/zhandijia/DockerData/zhandijia-root/ETPNav/data"
 print(f"data_path = {data_path}")

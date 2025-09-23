@@ -183,7 +183,10 @@ def parse_spatial_instruction(language_instr):
 
 
 if __name__ == '__main__':
-    instruction = 'Walk forward down the hall past the table on the left. Continue going forward to you reach the open doorway to the left. Turn left and walk forward, stop in front of the doorway to the bathroom. Turn right and enter that hallway stop and wait in front of the sink on your right.'
+    instruction = ('Walk forward down the hall past the table on the left.'
+                   ' Continue going forward to you reach the open doorway to the left. '
+                   'Turn left and walk forward, stop in front of the doorway to the bathroom. '
+                   'Turn right and enter that hallway stop and wait in front of the sink on your right.')
 
     text = parse_spatial_instruction(instruction)
     print(text)
