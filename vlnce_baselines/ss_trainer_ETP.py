@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import time
 import traceback
 import uuid
@@ -37,6 +38,7 @@ from vlnce_baselines.common.env_utils import construct_envs, is_slurm_batch_job
 from vlnce_baselines.common.utils import extract_instruction_tokens
 from vlnce_baselines.common.utils import gather_list_and_concat
 from vlnce_baselines.models.graph_utils import GraphMap, MAX_DIST
+from .map_navigation.llm_utils import parse_object_goal_instruction, navigation_using_llm, get_navigation_prompt
 from .map_navigation.rgb_map import rgb_map_habitat_tools
 from .map_navigation.semantic_map import semantic_map_habitat_tools
 from .utils import get_camera_orientations12
@@ -69,6 +71,7 @@ class RLTrainer(BaseVLNCETrainer):
         self.graph_map_memory = {}  # {'scene_name': GraphMap}
         self.semantic_maps = {}
         self.rgb_maps = {}
+        self.finetune_datasets = []
 
     def _make_dirs(self):
         if self.config.local_rank == 0:
@@ -722,18 +725,24 @@ class RLTrainer(BaseVLNCETrainer):
 
             MY_H = 256
 
-            # sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"RGB_SENSOR")
-            # for camera_id, orient in orient_dict.items():
-            #     camera_template = f"MYRG{camera_id}"
-            #     camera_config = deepcopy(sensor)
-            #     camera_config.WIDTH = MY_H
-            #     camera_config.HEIGHT = MY_H
-            #     camera_config.ORIENTATION = orient
-            #     camera_config.UUID = camera_template.lower()
-            #     camera_config.HFOV = 90
-            #     sensor_uuids.append(camera_config.UUID)
-            #     setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
-            #     self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
+            camera_orientations = get_camera_orientations12()
+            camera_orientations['0'] = [0.0, 0.0, 0.0]
+
+            sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"RGB_SENSOR")
+            for camera_id, orient in camera_orientations.items():
+                camera_id = int(camera_id)
+                postfix = '' if camera_id == 0 else f'_{camera_id}'
+
+                camera_template = f"myrg{postfix}"
+                camera_config = deepcopy(sensor)
+                camera_config.WIDTH = MY_H
+                camera_config.HEIGHT = MY_H
+                camera_config.ORIENTATION = orient
+                camera_config.UUID = camera_template.lower()
+                camera_config.HFOV = 90
+                sensor_uuids.append(camera_config.UUID)
+                setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
+                self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
             #
             # sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"DEPTH_SENSOR")
             # for camera_id, orient in orient_dict.items():
@@ -748,21 +757,21 @@ class RLTrainer(BaseVLNCETrainer):
             #     setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
             #     self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
 
-            camera_orientations = get_camera_orientations12()
-            camera_orientations['0'] = [0.0, 0.0, 0.0]
-
-            sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"SEMANTIC_SENSOR")
-            for camera_id, orient in camera_orientations.items():
-                camera_template = f"MYSEMANTI_{camera_id}"
-                camera_config = deepcopy(sensor)
-                camera_config.WIDTH = MY_H
-                camera_config.HEIGHT = MY_H
-                camera_config.ORIENTATION = orient
-                camera_config.UUID = camera_template.lower()
-                camera_config.HFOV = 90
-                sensor_uuids.append(camera_config.UUID)
-                setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
-                self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
+            # camera_orientations = get_camera_orientations12()
+            # camera_orientations['0'] = [0.0, 0.0, 0.0]
+            #
+            # sensor = getattr(self.config.TASK_CONFIG.SIMULATOR, f"SEMANTIC_SENSOR")
+            # for camera_id, orient in camera_orientations.items():
+            #     camera_template = f"MYSEMANTI_{camera_id}"
+            #     camera_config = deepcopy(sensor)
+            #     camera_config.WIDTH = MY_H
+            #     camera_config.HEIGHT = MY_H
+            #     camera_config.ORIENTATION = orient
+            #     camera_config.UUID = camera_template.lower()
+            #     camera_config.HFOV = 90
+            #     sensor_uuids.append(camera_config.UUID)
+            #     setattr(self.config.TASK_CONFIG.SIMULATOR, camera_template, camera_config)
+            #     self.config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS.append(camera_template)
         self.config.freeze()
 
         if self.config.EVAL.SAVE_RESULTS:
@@ -807,6 +816,11 @@ class RLTrainer(BaseVLNCETrainer):
             # while len(self.stat_eps) < 200:
             #     self.customize_rollout('eval')
             self.customize_rollout_top_down_map('eval')
+
+        # 保存 self.finetune_datasets 到本地 JSON 文件
+        with open('data/logs/maps/finetune_datasets.json', 'w', encoding='utf-8') as f:
+            json.dump(self.finetune_datasets, f, ensure_ascii=False, indent=2)
+
         self.envs.close()
 
         if self.world_size > 1:
@@ -3013,25 +3027,34 @@ class RLTrainer(BaseVLNCETrainer):
         batch = batch_obs(observations, self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
-        current_episode_name = self.envs.call_at(0, "get_episode")['name']
+        episode_info = self.envs.call_at(0, "get_episode")
+        current_scene_name = episode_info['scene_id']
+        current_episode_name = episode_info['name']
+        instructions = [instruction.instruction_text for instruction in
+                        self.envs.call(['get_instruction'] * self.envs.num_envs)]
+        instruction_objects = [parse_object_goal_instruction(instruction) for instruction in instructions]
+        # instruction_objects = []
 
-        if len(self.rgb_maps) == 0:
-            rgb_map_path = os.path.join('data/logs/maps', current_episode_name, '_rgb.npy')
-            semantic_map_path = os.path.join('data/logs/maps', current_episode_name, '_semantic.npy')
-            if os.path.exists(rgb_map_path):
-                semantic_map = semantic_map_habitat_tools(saved_folder='data/logs/maps',
-                                                          MIN_DEPTH=0.0,
-                                                          MAX_DEPTH=10.0)
+        # curr_eps_tmp = self.envs.current_episodes()
+        # curr_eps_tmp[0].goals[0].position
+
+        if len(self.semantic_maps) == 0:
+            rgb_map_path = f'data/logs/maps/{current_scene_name}_rgb.npy'
+            semantic_map_path = f'data/logs/maps/{current_scene_name}_semantic.npy'
+
+            semantic_map = semantic_map_habitat_tools(saved_folder=f'data/logs/maps/{current_scene_name}',
+                                                      MIN_DEPTH=0.0,
+                                                      MAX_DEPTH=10.0)
+            rgb_map = rgb_map_habitat_tools(saved_folder=f'data/logs/maps/{current_scene_name}', MIN_DEPTH=0.0,
+                                            MAX_DEPTH=10.0)
+
+            if os.path.exists(semantic_map_path):
                 semantic_map.load_complete_map(semantic_map_path)
-                self.semantic_maps[current_episode_name] = semantic_map
-                self.rgb_maps[current_episode_name] = rgb_map_habitat_tools(saved_folder='data/logs/maps',
-                                                                            MIN_DEPTH=0.0,
-                                                                            MAX_DEPTH=10.0)
+            if os.path.exists(rgb_map_path):
+                rgb_map.load_complete_rgb_map(rgb_map_path)
 
-        self.envs.call_at(0, "update_top_down_map", {"semantic_map": self.semantic_maps[current_episode_name],
-                                                     "rgb_map": self.rgb_maps[current_episode_name]})
-
-        self.envs.call_at(0, "get_top_down_map")
+            self.semantic_maps[current_scene_name] = semantic_map
+            self.rgb_maps[current_scene_name] = rgb_map
 
         if mode == 'eval':
             env_to_pause = [i for i, ep in enumerate(self.envs.current_episodes())
@@ -3157,15 +3180,116 @@ class RLTrainer(BaseVLNCETrainer):
                 raise NotImplementedError
             cpu_a_t = a_t.cpu().numpy()
 
+            waypoint_chosen_list = []
+            env_datasets = [{
+                'messages': [],
+                'images': [],
+            } for _ in range(self.envs.num_envs)]
+            for i in range(self.envs.num_envs):
+                # 1) 选择最近的 k 个 ghost（带 id）
+                k = getattr(self.config, "TOPDOWN_MAP_K_NEAREST_GHOSTS", 5)
+                agent_xyz = np.asarray(cur_pos[i], dtype=np.float32)  # [x, y, z]
+                ghost_items = list(self.gmaps[i].ghost_aug_pos.values())  # [(ghost_id, [x,y,z]), ...]
+                if len(ghost_items) > 0:
+                    k_eff = min(k, len(ghost_items))
+                    dists_sq = np.array(
+                        [(gpos[0] - agent_xyz[0]) ** 2 + (gpos[2] - agent_xyz[2]) ** 2 for gpos in ghost_items],
+                        dtype=np.float32
+                    )
+                    ghosts_near_ids = np.argsort(dists_sq)[:k_eff]
+                    ghosts_near_pos = [ghost_items[j] for j in ghosts_near_ids]  # [(gid, pos), ...]
+                    # ghosts_near_ids = [gid for gid, _ in ghosts_near]  # 映射表：子集序号 → 原始 gid
+                    # ghosts_near_pos = [gpos for _, gpos in ghosts_near]  # 仅位置用于可视化/LLM
+                else:
+                    ghosts_near_ids, ghosts_near_pos = [], []
+
+                waypoint_dirs = self.envs.call_at(i, "update_top_down_map",
+                                                  {"semantic_map": self.semantic_maps[current_scene_name],
+                                                   "rgb_map": self.rgb_maps[current_scene_name],
+                                                   "vis_info": {
+                                                       'nodes': list(self.gmaps[i].node_pos.values()),
+                                                       'ghosts': ghosts_near_pos,
+                                                       # 'ghosts': list(self.gmaps[i].ghost_aug_pos.values()),
+                                                       # 'predict_ghost': ghost_pos,
+                                                       # 'teacher_ghost': teacher_ghost,
+                                                   },
+                                                   "skip_build": True,  # 只更新位置，不重新构建
+                                                   })
+                # self.envs.call_at(i, "get_top_down_map")
+
+                map_path = self.envs.call_at(i, "get_top_down_map_with_waypoint",
+                                             {"rgb_map": self.rgb_maps[current_scene_name],
+                                              "semantic_map": self.semantic_maps[current_scene_name],
+                                              'display_object_classes': instruction_objects[i]})
+
+                teacher_select_ghost_node = nav_inputs['gmap_vp_ids'][i][teacher_actions[i].cpu().item()]
+
+                if teacher_select_ghost_node is not None:
+                    teacher_select_ghost_node_pos = self.gmaps[i].ghost_aug_pos[teacher_select_ghost_node]
+
+                    closet_node_idx = -2
+                    for node_idx, node_pos in enumerate(ghosts_near_pos):
+                        if np.linalg.norm(node_pos - teacher_select_ghost_node_pos) < 1e-3:
+                            closet_node_idx = node_idx
+                            break
+                else:
+                    closet_node_idx = -1
+
+                if closet_node_idx == -2:
+                    env_datasets[i] = {}
+                else:
+                    prompt = get_navigation_prompt(instructions[i], map_path, waypoint_count=len(ghosts_near_pos),
+                                                   waypoint_dirs=waypoint_dirs)
+                    env_datasets[i]['messages'].append({
+                        "content": f"{prompt}<image>",
+                        "role": "user"
+                    })
+                    env_datasets[i]['messages'].append({
+                        "content": f"""
+                                    Waypoint Chosen: {closet_node_idx}
+                                    Waypoint Directions: {"; ".join(f"{i}={d}" for i, d in enumerate(waypoint_dirs))}
+                                    """,
+                        "role": "assistant"
+                    })
+                    env_datasets[i]['images'].append(os.path.abspath(map_path))
+
+                    env_datasets[i]['extra_info'] = {
+                        'instruction': instructions[i],
+                        'episode_name': current_episode_name,
+                        'step': stepk,
+                    }
+
+                    self.finetune_datasets.append(env_datasets[i])
+
+                result = navigation_using_llm(instructions[i], map_path, waypoint_count=len(ghosts_near_pos),
+                                              waypoint_dirs=waypoint_dirs)
+
+                # 4) 将 LLM 的序号映射回原始 ghost id（1-based → 0-based）
+                match = re.search(r"Waypoint Chosen:\s*(\d+)", result)
+                idx_1b = int(match.group(1))
+                chosen_gid = ghosts_near_ids[idx_1b]
+                waypoint_chosen_list.append(chosen_gid)
+
+                result = navigation_using_llm(instructions[i], map_path, waypoint_count=len(self.gmaps[i].ghost_aug_pos))
+
+                match = re.search(r'Waypoint Chosen:\s*(\d+)', result)
+                waypoint_chosen_list.append(int(match.group(1)) if match else None)
+
             # make equiv action
             env_actions = []
             use_tryout = (self.config.IL.tryout and not self.config.TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING)
             for i, gmap in enumerate(self.gmaps):
-                if cpu_a_t[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]:
+                llm_select_node = waypoint_chosen_list[i]
+                if llm_select_node != -1:
+                    llm_select_node = waypoint_chosen_list[i] + 1 + len(self.gmaps[i].node_pos)
+
+                if llm_select_node == -1 or stepk == self.max_len - 1 or no_vp_left[i]:
+                # if teacher_actions[i] == 0 or stepk == self.max_len - 1 or no_vp_left[i]:
                     # stop at node with max stop_prob
                     vp_stop_scores = [(vp, stop_score) for vp, stop_score in gmap.node_stop_scores.items()]
                     stop_scores = [s[1] for s in vp_stop_scores]
                     stop_vp = vp_stop_scores[np.argmax(stop_scores)][0]
+                    stop_pos = gmap.node_pos[stop_vp]
                     stop_pos = gmap.node_pos[stop_vp]
                     if self.config.IL.back_algo == 'control':
                         back_path = [(vp, gmap.node_pos[vp]) for vp in gmap.shortest_path[cur_vp[i]][stop_vp]]
@@ -3190,7 +3314,8 @@ class RLTrainer(BaseVLNCETrainer):
                         }
                     )
                 else:
-                    ghost_vp = nav_inputs['gmap_vp_ids'][i][cpu_a_t[i]]
+                    ghost_vp = nav_inputs['gmap_vp_ids'][i][llm_select_node]
+                    # ghost_vp = nav_inputs['gmap_vp_ids'][i][teacher_actions[i]]
                     ghost_pos = gmap.ghost_aug_pos[ghost_vp]
                     _, front_vp = gmap.front_to_ghost_dist(ghost_vp)
                     front_pos = gmap.node_pos[front_vp]
@@ -3233,6 +3358,9 @@ class RLTrainer(BaseVLNCETrainer):
 
             outputs = self.envs.step(env_actions)
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+            # cv2.imwrite(
+            #     map_path.replace('_rotated', '').replace('_semantic_map.jpg', '_waypoint.png'),
+            #     self.envs.call_at(0, "get_plan_frame", {"vis_info": vis_info, "append_frame": False}))
 
             # calculate metric
             if mode == 'eval':

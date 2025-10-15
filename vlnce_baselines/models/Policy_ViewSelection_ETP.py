@@ -312,7 +312,7 @@ class ETP(Net):
                     #     probs_c.log_prob(way_heats_act))
             else:
                 # batch_way_log_prob = None
-                None
+                pass
             
             rgb_feats = self.space_pool_rgb(rgb_feats)
             depth_feats = self.space_pool_depth(depth_feats)

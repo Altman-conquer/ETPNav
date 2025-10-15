@@ -493,32 +493,68 @@ def get_ins2cat_dict():
     return ins2cat_dict
 
 
-def deduplicate_objects(object_map, eps=1.0):
+# def deduplicate_objects(object_map, eps=1.0):
+#     unique_objects = []
+#     if not object_map:
+#         return unique_objects
+#     positions = np.array([obj['position'] for obj in object_map])
+#     labels = np.array([obj['label'] for obj in object_map])
+#     confs = np.array([obj.get('conf', 1.0) for obj in object_map])
+#     for inst_id in np.unique(labels):
+#         mask = (labels == inst_id)
+#         if np.sum(mask) <= 1:
+#             continue
+#         db = DBSCAN(eps=eps, min_samples=1).fit(positions[mask])
+#         cluster_labels = db.labels_
+#         for label in set(cluster_labels):
+#             cluster_points = positions[mask][cluster_labels == label]
+#
+#             if len(cluster_points) == 0:
+#                 raise ValueError("cluster_confs 为空，无法计算cluster_confs.max()。")
+#
+#             center = cluster_points.mean(axis=0)
+#             cluster_confs = confs[mask][cluster_labels == label]
+#             mean_conf = cluster_confs.max()
+#             count = len(cluster_points)  # 统计每个聚类中点的个数
+#             unique_objects.append({'position': center, 'label': inst_id, 'conf': mean_conf, 'count': count})
+#     return unique_objects
+
+def deduplicate_objects(object_map, distance_thresh=1.0):
     unique_objects = []
     if not object_map:
         return unique_objects
     positions = np.array([obj['position'] for obj in object_map])
     labels = np.array([obj['label'] for obj in object_map])
     confs = np.array([obj.get('conf', 1.0) for obj in object_map])
+    visited = np.zeros(len(positions), dtype=bool)
     for inst_id in np.unique(labels):
         mask = (labels == inst_id)
-        if np.sum(mask) <= 1:
-            continue
-        db = DBSCAN(eps=eps, min_samples=1).fit(positions[mask])
-        cluster_labels = db.labels_
-        for label in set(cluster_labels):
-            cluster_points = positions[mask][cluster_labels == label]
+        idxs = np.where(mask)[0]
+        clusters = []
+        for i in idxs:
+            if visited[i]:
+                continue
+            cluster = [i]
+            visited[i] = True
+            for j in idxs:
+                if not visited[j]:
+                    dist = np.linalg.norm(positions[i] - positions[j])
+                    if dist < distance_thresh:
+                        cluster.append(j)
+                        visited[j] = True
+            clusters.append(cluster)
+        for cluster in clusters:
+            cluster_points = positions[cluster]
+            count = len(cluster_points)
 
-            if len(cluster_points) == 0:
-                raise ValueError("cluster_confs 为空，无法计算cluster_confs.max()。")
+            if count <= 1:
+                continue
 
+            cluster_confs = confs[cluster]
             center = cluster_points.mean(axis=0)
-            cluster_confs = confs[mask][cluster_labels == label]
             mean_conf = cluster_confs.max()
-            count = len(cluster_points)  # 统计每个聚类中点的个数
             unique_objects.append({'position': center, 'label': inst_id, 'conf': mean_conf, 'count': count})
     return unique_objects
-
 
 def get_semantic_segmentation_result(images: list):
     def prepare_image(img: Union[str, np.ndarray, Image.Image]) -> bytes:

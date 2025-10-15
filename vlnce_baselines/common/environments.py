@@ -1,6 +1,3 @@
-import time
-from typing import Any, Dict, Optional, Tuple, List, Union
-
 import os
 import random
 import time
@@ -508,39 +505,77 @@ class VLNCEDaggerEnv(habitat.RLEnv):
         phi = cartesian_to_polar(
             -heading_vector[2], heading_vector[0])[1]
         angle = phi
-        print(f'agent position = {agent_pos}, angle = {angle}')
+        # print(f'agent position = {agent_pos}, angle = {angle}')
         pose = (agent_pos[0], agent_pos[2], angle)
         return pose
 
-    def update_top_down_map(self, rgb_map: rgb_map_habitat_tools, semantic_map: semantic_map_habitat_tools):
+    def update_top_down_map(self, rgb_map: rgb_map_habitat_tools, semantic_map: semantic_map_habitat_tools,
+                            vis_info: dict, skip_build: bool = False):
         agent_state = self._env.sim.get_agent_state()
         observations = self.get_observation_at(agent_state.position, agent_state.rotation)
 
-        rgb_poses = []
-        depth_poses = []
-        rgb_imgs = []
-        depth_imgs = []
+        info = self.get_info(observations)
+        vis_info['agent_angle'] = info['top_down_map_vlnce']['agent_angle']
 
-        for degree in range(0, 360, 30):
-            postfix = '' if degree == 0 else f'_{degree}'
+        waypoint_dirs = []
+        agent_angle = vis_info['agent_angle']
+        agent_pos = vis_info['nodes'][-1]
+        ghost_nodes = vis_info['ghosts']
 
-            depth = observations['depth' + postfix]
-            rgb = observations['rgb' + postfix]
-            # semantic = observations[f'mysemanti_{degree}']
+        if not skip_build:
+            rgb_poses = []
+            depth_poses = []
+            rgb_imgs = []
+            depth_imgs = []
 
-            rgb_poses.append(self.get_agent_pose(agent_state.sensor_states['rgb' + postfix]))
-            depth_poses.append(self.get_agent_pose(agent_state.sensor_states['depth' + postfix]))
+            for degree in range(0, 360, 30):
+                postfix = '' if degree == 0 else f'_{degree}'
 
-            rgb_imgs.append(rgb)
-            depth_imgs.append(depth)
+                depth = observations['depth' + postfix]
+                rgb = observations['myrg' + postfix]
+                # semantic = observations[f'mysemanti_{degree}']
 
-        semantics = semantic_map.detect(rgb_imgs)
-        detect_results = rgb_map.get_detect_result(rgb_imgs)
+                rgb_poses.append(self.get_agent_pose(agent_state.sensor_states['myrg' + postfix]))
+                depth_poses.append(self.get_agent_pose(agent_state.sensor_states['depth' + postfix]))
 
-        for rgb, depth, semantic, pose, detect_result in zip(rgb_imgs, depth_imgs, semantics, depth_poses,
-                                                             detect_results):
-            # rgb_map.build_rgb_map(rgb, depth, detect_result['boxes'], pose, -1)
-            semantic_map.build_semantic_map(detect_result['boxes'], depth, semantic, pose, -1)
+                rgb_imgs.append(rgb)
+                depth_imgs.append(depth)
+
+            semantics = semantic_map.detect(rgb_imgs)
+            detect_results = rgb_map.get_detect_result(rgb_imgs)
+
+            for rgb, depth, semantic, pose, detect_result in zip(rgb_imgs, depth_imgs, semantics, depth_poses,
+                                                                 detect_results):
+                rgb_map.build_rgb_map(rgb, depth, detect_result['boxes'], pose, -1, vis_info=vis_info)
+                semantic_map.build_semantic_map(detect_result['boxes'], depth, semantic, pose, -1, vis_info=vis_info)
+        else:
+            rgb_map.vis_info = vis_info
+            semantic_map.vis_info = vis_info
+
+        # 计算每个 waypoint 相对于 agent 的八向标记
+        direction_labels = [
+            "front", "front-right", "right", "back-right",
+            "back", "back-left", "left", "front-left"
+        ]
+        for wp_pos in ghost_nodes:
+            dx = wp_pos[0] - agent_pos[0]
+            dz = wp_pos[2] - agent_pos[2]
+            # 世界坐标系下的角度 (0°~360°)
+            world_deg = (math.degrees(math.atan2(dz, dx)) + 360) % 360
+            # agent 当前朝向（弧度转度）
+            agent_deg = math.degrees(agent_angle) - 90
+            # 计算相对角度并归一到 [0, 360)
+            rel_deg = (world_deg - agent_deg + 360) % 360
+            # 加 22.5° 后整除 45° 得到区间索引
+            idx = int(((rel_deg + 22.5) % 360) // 45)
+            waypoint_dirs.append(direction_labels[idx])
+
+        return waypoint_dirs
+
+    def get_top_down_map_with_waypoint(self, rgb_map: rgb_map_habitat_tools, semantic_map: semantic_map_habitat_tools,
+                                       display_object_classes: list = None):
+        # return semantic_map.save_final_map(display_object_classes=display_object_classes, ENLARGE_SIZE=2)
+        return rgb_map.save_final_map(display_object_classes=display_object_classes, ENLARGE_SIZE=2)
 
     def get_top_down_map(self):
         agent_state = self._env.sim.get_agent_state()
